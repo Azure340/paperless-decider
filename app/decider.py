@@ -568,9 +568,7 @@ def build_state(doc, max_chars):
     content = str(doc.get("content") or "").strip()
     budget = max(200, max_chars - len(title) - len(filename) - 24)
     newline = chr(10)
-    return (
-        "TITLE: " + title + newline + "FILENAME: " + filename + newline + newline + content[:budget]
-    )
+    return "TITLE: " + title + newline + "FILENAME: " + filename + newline + newline + content[:budget]
 
 
 # --------------------------------------------------------------------------
@@ -827,6 +825,18 @@ class Handler(BaseHTTPRequestHandler):
             supplied = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
         return supplied == self.cfg.secret
 
+    def _reject_unless_authorized(self, path):
+        """Every endpoint but /healthz leaks document titles, so it is guarded.
+
+        The container's published port is loopback-only by default, but the
+        docker network is shared with paperless and anything else on it.
+        """
+        if path == "/healthz" or self._authorized():
+            return True
+        LOG.warning("401 from %s on %s (missing or wrong X-Decider-Token)", self.client_address[0], path)
+        self._send(401, {"error": "unauthorized"})
+        return False
+
     @staticmethod
     def _extract_doc_id(payload):
         for key in ("id", "document_id", "doc_id"):
@@ -866,13 +876,11 @@ class Handler(BaseHTTPRequestHandler):
                 404,
                 {
                     "error": "unknown path",
-                    "endpoints": ["/decide", "/decide/sync", "/preview/<id>", "/status", "/healthz"],
+                    "endpoints": ["/decide", "/decide/sync", "/preview", "/status", "/healthz"],
                 },
             )
             return
-        if not self._authorized():
-            LOG.warning("401 from %s (bad or missing X-Decider-Token)", self.client_address[0])
-            self._send(401, {"error": "unauthorized"})
+        if not self._reject_unless_authorized(path):
             return
         payload, ok = self._read_payload()
         if not ok:
@@ -908,6 +916,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         path = urllib.parse.urlparse(self.path).path
+        if not self._reject_unless_authorized(path):
+            return
         if path == "/healthz":
             self._send(
                 200,
