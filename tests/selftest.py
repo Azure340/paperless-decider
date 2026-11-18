@@ -5,8 +5,8 @@
 
 Starts throwaway servers on 127.0.0.1, points the real decider code at them and
 asserts shortlisting, thresholds, review tagging, dry-run, idempotence and the
-HTTP surface. Non-zero exit on failure - paste the whole output when asking for
-help. Nothing outside 127.0.0.1 is contacted.
+HTTP surface (including that every endpoint except /healthz needs the shared
+secret). Non-zero exit on failure - paste the whole output when asking for help.
 """
 
 import json
@@ -25,6 +25,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(HERE), "app"))
 PAPERLESS_PORT = 18099
 OLLAMA_PORT = 18100
 SIDECAR_PORT = 18101
+SECRET = "s3cret"
 
 PATCHES = []
 
@@ -204,9 +205,10 @@ def serve(handler):
     return httpd
 
 
-def get_json(url):
+def read_json(url, headers=None):
+    req = urllib.request.Request(url, headers=headers or {}, method="GET")
     try:
-        with urllib.request.urlopen(url, timeout=10) as resp:
+        with urllib.request.urlopen(req, timeout=10) as resp:
             return json.loads(resp.read().decode())
     except urllib.error.HTTPError as exc:
         return {"_status": exc.code, "_body": exc.read().decode("utf-8", "replace")[:200]}
@@ -234,7 +236,7 @@ def main():
             "PAPERLESS_API_TOKEN": "testtoken",
             "OLLAMA_URL": "http://127.0.0.1:" + str(OLLAMA_PORT),
             "DECIDER_MODEL": "fake-decision",
-            "DECIDER_SHARED_SECRET": "s3cret",
+            "DECIDER_SHARED_SECRET": SECRET,
             "DECIDER_FIELDS": "correspondent,document_type,storage_path,tag",
             "DECIDER_OVERWRITE": "false",
             "DECIDER_DRY_RUN": "false",
@@ -247,7 +249,7 @@ def main():
             "DECIDER_MIN_CONTENT_CHARS": "80",
             "DECIDER_HOST": "127.0.0.1",
             "DECIDER_PORT": str(SIDECAR_PORT),
-            "DECIDER_LOG_LEVEL": "ERROR",
+            "DECIDER_LOG_LEVEL": "CRITICAL",
         }
     )
     fakes = [serve(FakePaperless), serve(FakeOllama)]
@@ -295,7 +297,7 @@ def main():
     check(
         "review tag + confident tag + pre-existing tag all kept",
         sorted(patch.get("tags") or []) == [1, 2, 90],
-        "tags=" + str(patch.get("tags")) + " (1 Insurance, 2 pre-existing Car, 90 ai-review)",
+        "tags=" + str(patch.get("tags")),
     )
     check(
         "storage_path untouched (already set, overwrite off)",
@@ -314,9 +316,10 @@ def main():
         str(missing),
     )
 
+    import dataclasses
+
     before = len(PATCHES)
-    dry_cfg = dataclasses_replace(decider, cfg, dry_run=True)
-    dry = decider.process_document(77, dry_cfg, pl, ollama)
+    dry = decider.process_document(77, dataclasses.replace(cfg, dry_run=True), pl, ollama)
     check(
         "dry run decides but writes nothing",
         len(PATCHES) == before
@@ -325,7 +328,7 @@ def main():
         str(dry.get("result")),
     )
 
-    single = dataclasses_replace(decider, cfg, fields=("storage_path",))
+    single = dataclasses.replace(cfg, fields=("storage_path",))
     again = decider.process_document(77, single, pl, ollama)
     check(
         "no PATCH when nothing would change",
@@ -346,14 +349,13 @@ def main():
     Sidecar.ollama = ollama
     Sidecar.port = SIDECAR_PORT
     sidecar = serve(Sidecar)
-    time.sleep(0.2)
+    time.sleep(0.3)
+
+    base = "http://127.0.0.1:" + str(SIDECAR_PORT)
+    auth = {"X-Decider-Token": SECRET}
 
     started = time.monotonic()
-    accepted = post_json(
-        "http://127.0.0.1:" + str(SIDECAR_PORT) + "/decide",
-        {"id": "999"},
-        {"X-Decider-Token": "s3cret"},
-    )
+    accepted = post_json(base + "/decide", {"id": "999"}, auth)
     elapsed = time.monotonic() - started
     check(
         "POST /decide answers far inside paperless' 5s webhook timeout",
@@ -362,30 +364,31 @@ def main():
     )
     check(
         "rejects a wrong shared secret with 401",
-        post_json(
-            "http://127.0.0.1:" + str(SIDECAR_PORT) + "/decide", {"id": "999"}, {}
-        ).get("_status")
-        == 401,
+        post_json(base + "/decide", {"id": "999"}, {}).get("_status") == 401,
     )
     check(
         "422 when the workflow sent no id",
-        post_json(
-            "http://127.0.0.1:" + str(SIDECAR_PORT) + "/decide",
-            {"title": "x"},
-            {"X-Decider-Token": "s3cret"},
-        ).get("_status")
-        == 422,
+        post_json(base + "/decide", {"title": "x"}, auth).get("_status") == 422,
     )
-    time.sleep(0.4)
+    check("/healthz stays open for the container healthcheck", read_json(base + "/healthz").get("ok") is True)
+    check(
+        "GET /status needs the shared secret too",
+        read_json(base + "/status").get("_status") == 401,
+    )
+    check(
+        "GET /preview/<id> needs the shared secret too",
+        read_json(base + "/preview/77").get("_status") == 401,
+    )
+    time.sleep(0.5)
 
     patches_now = len(PATCHES)
-    preview = get_json("http://127.0.0.1:" + str(SIDECAR_PORT) + "/preview/77")
+    preview = read_json(base + "/preview/77", auth)
     check(
         "GET /preview/<id> returns decisions and writes nothing",
         "decisions" in preview and len(PATCHES) == patches_now and preview.get("dry_run") is True,
         str(preview)[:200],
     )
-    status = get_json("http://127.0.0.1:" + str(SIDECAR_PORT) + "/status")
+    status = read_json(base + "/status", auth)
     check("GET /status exposes recent results", bool(status.get("last_results")), str(status)[:160])
 
     for httpd in fakes + [sidecar]:
@@ -397,12 +400,6 @@ def main():
     print("")
     print(str(len(checks) - len(failed)) + "/" + str(len(checks)) + " checks passed")
     return 1 if failed else 0
-
-
-def dataclasses_replace(decider, cfg, **changes):
-    import dataclasses
-
-    return dataclasses.replace(cfg, **changes)
 
 
 if __name__ == "__main__":
