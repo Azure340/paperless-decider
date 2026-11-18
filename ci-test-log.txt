@@ -12,7 +12,9 @@ PASS  fetches == 1 + title_poll_tries
 8/9 checks passed
 title_wait_exit=1
 == tests/selftest.py ==
-401 from 127.0.0.1 (bad or missing X-Decider-Token)
+401 from 127.0.0.1 on /decide (missing or wrong X-Decider-Token)
+401 from 127.0.0.1 on /status (missing or wrong X-Decider-Token)
+401 from 127.0.0.1 on /preview/77 (missing or wrong X-Decider-Token)
 PASS  capability probe sees 'decision'
 PASS  shortlist keeps the names present in the text, drops the rest
 PASS  exactly one PATCH, to the right document
@@ -30,10 +32,10 @@ PASS  POST /decide answers far inside paperless' 5s webhook timeout
 PASS  rejects a wrong shared secret with 401
 PASS  422 when the workflow sent no id
 PASS  /healthz stays open for the container healthcheck
-FAIL  GET /status needs the shared secret too  :: 
-FAIL  GET /preview/<id> needs the shared secret too  :: 
+PASS  GET /status needs the shared secret too
+PASS  GET /preview/<id> needs the shared secret too
 PASS  GET /preview/<id> returns decisions and writes nothing
 PASS  GET /status exposes recent results
 
-19/21 checks passed
-selftest_exit=1
+21/21 checks passed
+selftest_exit=0
