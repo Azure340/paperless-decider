@@ -90,13 +90,14 @@ def main():
         0.08 < elapsed < 1.0 and report.get("title_wait_seconds") in (0.1, 0.15),
         str(round(elapsed, 2)) + " " + str(report),
     )
+    check("a successful wait records no give-up note", "title_wait" not in report, str(report))
 
     stub = StubPaperless([placeholder] * 30)
     report = {}
     got = decider.reload_for_title(5, wait, stub, report)
     check(
-        "budget exhausted -> proceeds with a note instead of blocking forever",
-        got is not None and "gave up" in report.get("title_wait", ""),
+        "budget exhausted -> proceeds and says so instead of blocking forever",
+        got is not None and "wait budget" in report.get("title_wait", ""),
         str(report),
     )
     check(
