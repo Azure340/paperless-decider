@@ -29,8 +29,11 @@ PASS  no PATCH when nothing would change
 PASS  POST /decide answers far inside paperless' 5s webhook timeout
 PASS  rejects a wrong shared secret with 401
 PASS  422 when the workflow sent no id
+PASS  /healthz stays open for the container healthcheck
+FAIL  GET /status needs the shared secret too  :: 
+FAIL  GET /preview/<id> needs the shared secret too  :: 
 PASS  GET /preview/<id> returns decisions and writes nothing
 PASS  GET /status exposes recent results
 
-18/18 checks passed
-selftest_exit=0
+19/21 checks passed
+selftest_exit=1
