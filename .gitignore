@@ -1,0 +1,16 @@
+# never commit real credentials
+.env
+.env.local
+*.env
+!.env.example
+
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# editor / os
+.vscode/
+.idea/
+.DS_Store
