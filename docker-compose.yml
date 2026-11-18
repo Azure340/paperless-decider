@@ -1,0 +1,59 @@
+# Compose file for the published image - paste this into Komodo as a Stack
+# (Manual stack, or point a Git stack at this file).
+#
+# Values in ${BRACKETS} come from the stack's Variables in Komodo, or from a
+# .env file next to this compose file when you run it with the docker CLI.
+# Copy .env.example to .env for the CLI route. Never commit a real .env.
+
+services:
+  paperless-decider:
+    image: ghcr.io/azure340/paperless-decider:latest
+    container_name: paperless-decider
+    restart: unless-stopped
+    environment:
+      # ---- required -----------------------------------------------------
+      PAPERLESS_URL: ${PAPERLESS_URL:-http://paperless:8000}
+      PAPERLESS_API_TOKEN: ${PAPERLESS_API_TOKEN:?set PAPERLESS_API_TOKEN in the stack variables}
+      DECIDER_SHARED_SECRET: ${DECIDER_SHARED_SECRET:?set DECIDER_SHARED_SECRET in the stack variables}
+      OLLAMA_URL: ${OLLAMA_URL:-http://ollama:11434}
+      DECIDER_MODEL: ${DECIDER_MODEL:-tev1}
+      # ---- what to decide -----------------------------------------------
+      DECIDER_FIELDS: ${DECIDER_FIELDS:-tag}
+      DECIDER_WAIT_FOR_TITLE: ${DECIDER_WAIT_FOR_TITLE:-true}
+      DECIDER_TITLE_POLL_SECONDS: ${DECIDER_TITLE_POLL_SECONDS:-5}
+      DECIDER_TITLE_POLL_TRIES: ${DECIDER_TITLE_POLL_TRIES:-12}
+      # ---- confidence policy -------------------------------------------
+      DECIDER_THRESH_SINGLE: ${DECIDER_THRESH_SINGLE:-0.85}
+      DECIDER_THRESH_TAG: ${DECIDER_THRESH_TAG:-0.80}
+      DECIDER_MAX_SINGLE_OPTIONS: ${DECIDER_MAX_SINGLE_OPTIONS:-20}
+      DECIDER_MAX_TAG_OPTIONS: ${DECIDER_MAX_TAG_OPTIONS:-8}
+      # ---- write behaviour ---------------------------------------------
+      DECIDER_DRY_RUN: ${DECIDER_DRY_RUN:-true}
+      DECIDER_OVERWRITE: ${DECIDER_OVERWRITE:-false}
+      DECIDER_REVIEW_TAG: ${DECIDER_REVIEW_TAG:-needs-review}
+      DECIDER_DONE_TAG: ${DECIDER_DONE_TAG:-auto-tagged}
+      DECIDER_REVIEW_ON_NO_TAGS: ${DECIDER_REVIEW_ON_NO_TAGS:-true}
+      # ---- inference plumbing / limits ---------------------------------
+      DECIDER_TIMEOUT: ${DECIDER_TIMEOUT:-60}
+      DECIDER_KEEP_ALIVE: ${DECIDER_KEEP_ALIVE:-15m}
+      DECIDER_WORKERS: ${DECIDER_WORKERS:-1}
+      DECIDER_TAXONOMY_TTL: ${DECIDER_TAXONOMY_TTL:-300}
+      DECIDER_LOG_LEVEL: ${DECIDER_LOG_LEVEL:-INFO}
+    # Loopback only: paperless reaches this container by name over the shared
+    # docker network, so nothing is exposed to the LAN. Change to "8090:8090"
+    # only if you want to probe it from another machine.
+    ports:
+      - "127.0.0.1:8090:8090"
+    networks:
+      - paperless
+    deploy:
+      resources:
+        limits:
+          memory: ${DECIDER_MEMORY_LIMIT:-128M}
+
+networks:
+  paperless:
+    # The network paperless itself is attached to. Find it with:
+    #   docker inspect <paperless-container> --format '{{range $k,$v := .NetworkSettings.Networks}}{{$k}}{{end}}'
+    name: ${PAPERLESS_NETWORK:-paperless_default}
+    external: true
