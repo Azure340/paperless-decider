@@ -6,11 +6,12 @@ PASS  accents and case do not matter
 PASS  wait_for_title=false reads the document exactly once
 PASS  it re-reads until the title arrives
 PASS  and it actually waited (2 polls)
-FAIL  budget exhausted -> proceeds with a note instead of blocking forever  :: {'title_wait': 'no AI title within the wait budget, proceeding anyway', 'title_wait_seconds': 0.2}
+PASS  a successful wait records no give-up note
+PASS  budget exhausted -> proceeds and says so instead of blocking forever
 PASS  fetches == 1 + title_poll_tries
 
-8/9 checks passed
-title_wait_exit=1
+10/10 checks passed
+title_wait_exit=0
 == tests/selftest.py ==
 401 from 127.0.0.1 on /decide (missing or wrong X-Decider-Token)
 401 from 127.0.0.1 on /status (missing or wrong X-Decider-Token)
