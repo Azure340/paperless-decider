@@ -15,10 +15,12 @@ This service sits beside paperless and is driven by a normal **Workflow → Send
 action. paperless itself is never patched or forked.
 
 ```
-Workflow 1  Document added   -> Apply AI suggestions (title)      [paperless' own LLM]
-                     |  saves the document -> fires Document updated
-                     v
-Workflow 2  Document updated -> webhook -> paperless-decider
+Workflow 1  Document added   -> [1] Apply AI suggestions (title)   [paperless' own LLM]
+                              -> [2] Send webhook -> paperless-decider
+                 (the AI step is a queued celery task and does NOT re-trigger a
+                  workflow, so both actions live in Workflow 1; the sidecar waits for
+                  the title to land before deciding - DECIDER_WAIT_FOR_TITLE=true)
+Workflow 2  Document updated -> webhook -> paperless-decider       [optional re-decide]
                  reads the document + /api/tags/ (shortlist <= 26 options)
                  asks Ollama /v1/systemone one yes/no question per tag
                  PATCHes back only tags above the confidence threshold
@@ -32,6 +34,8 @@ Workflow 2  Document updated -> webhook -> paperless-decider
 | `send_webhook` uses `httpx.Client(timeout=5.0)` | `/decide` enqueues and answers `202` immediately; decisions run in a background worker |
 | the webhook **response body is discarded** | metadata must be written back through the REST API (`PATCH`) |
 | `build_workflow_action_context()` sets `"id": ""` during Consumption | trigger must be *Document added* / *Document updated*, never *Consumption* |
+| `apply_ai_suggestions` ends with `# No document_updated signal to avoid loop` | the AI title step never fires a *Document updated* workflow: the webhook has to be a **second action of the same workflow** |
+| webhook params are Jinja2 (`{{ doc_id }}`, `{{ doc_title }}`) | `{id}` is not a variable, arrives literally, and the sidecar answers 422 |
 | `/v1/systemone` allows 2–26 options per `choice` question | big taxonomies are shortlisted before asking |
 | multiple questions in one request skew each other's probabilities | one question per request, `keep_alive` keeps the model warm |
 | `PAPERLESS_WEBHOOKS_ALLOWED_PORTS` is empty by default | no paperless env changes needed for a non-standard port |
@@ -41,10 +45,16 @@ Workflow 2  Document updated -> webhook -> paperless-decider
 - Ollama **>= 0.35.0** (0.35.1+ for vision decision models) with a pulled decision model.
 - paperless-ngx with AI enabled (for the title step) and an API token.
 - Both reachable from this container's docker network.
+- Enough RAM for the model you pick. `tev1:latest` is the **4b Q8_0** build (4.6 GB
+  weights, ~5.5 GB to run) and `nimble` is ~9.5 GB; start with **`tev1:0.8b`**
+  (834 MB). If the container running Ollama has a memory limit, loading a too-big
+  model gets llama-server SIGKILLed and `/v1/systemone` answers 500
+  `llama-server process has terminated: signal: killed` - which reaches the sidecar
+  as a closed connection, visible in `GET /status` as a `DecisionError`.
 
 Check your model really is a decision model:
 ```bash
-curl -s localhost:11434/api/show -d '{"model":"tev1"}' | python3 -c "import json,sys;print(json.load(sys.stdin).get('capabilities'))"
+curl -s localhost:11434/api/show -d '{"model":"tev1:0.8b"}' | python3 -c "import json,sys;print(json.load(sys.stdin).get('capabilities'))"
 # must include "decision". Imported GGUFs need `capabilities: ["decision"]` set at /api/create.
 ```
 
@@ -59,7 +69,7 @@ Everything is environment variables. **Never commit `.env`** (it is git-ignored)
 | `PAPERLESS_API_TOKEN` | — (required) | API + Per-User token; decides which documents/tags are visible |
 | `DECIDER_SHARED_SECRET` | — (required) | compared against the `X-Decider-Token` header |
 | `OLLAMA_URL` | `http://ollama:11434` | inference server |
-| `DECIDER_MODEL` | `tev1` | decision model name |
+| `DECIDER_MODEL` | `tev1:0.8b` | decision model name (use a small tag, see Requirements) |
 | `DECIDER_FIELDS` | `correspondent,document_type,tag` | pick any of `tag,correspondent,document_type,storage_path` |
 | `DECIDER_THRESH_TAG` | `0.80` | probability needed to add a tag |
 | `DECIDER_THRESH_SINGLE` | `0.85` | probability needed to set correspondent / type / path |
@@ -100,21 +110,26 @@ curl -s localhost:8090/healthz
 ```
 
 Verified offline with no network and no model (Python 3.11+, standard library only) —
-31 checks in total, run in CI on every push and PR:
+33 checks in total, run in CI on every push and PR:
 ```bash
 python3 tests/test_title_wait.py     # 10 checks: the title -> tags handoff
-python3 tests/selftest.py            # 21 checks: fake paperless + fake Ollama end to end
+python3 tests/selftest.py            # 23 checks: fake paperless + fake Ollama end to end
 ```
 
 ## paperless setup (two workflows)
 
 1. Create tags `auto-tagged` and `needs-review` (matching rule **None**, not inbox tags).
-2. **Workflow 1** — trigger *Document added*, action *Apply AI suggestions*, field **Title**.
-3. **Workflow 2** — trigger *Document updated*, conditions **Has not any of the tags**
-   `auto-tagged` **and** `needs-review`; action **Send webhook**:
+2. **Workflow 1** (the ingest path) — trigger *Document added*, two actions in this
+   order: *Apply AI suggestions* (field **Title**), then *Send webhook*:
    - URL `http://paperless-decider:8090/decide`
-   - Send as JSON **on**, parameter `id` = `{id}`
+   - Send as JSON **on**, parameter `id` = `{{ doc_id }}` — Jinja2, and `{id}` is not a
+     variable: it arrives as literal text and the sidecar rejects it with 422
    - header `X-Decider-Token` = your secret
+   Keep `DECIDER_WAIT_FOR_TITLE=true`: paperless queues the title as a celery task and
+   deliberately sends no `document_updated` afterwards, so the webhook arrives first.
+3. **Workflow 2** (optional, re-decide after a human edit) — trigger *Document updated*,
+   conditions **Has not any of the tags** `auto-tagged` **and** `needs-review`, with the
+   same webhook action.
 
 The two "has not" conditions are the loop guard: this service adds one of those tags, so
 Workflow 2 stops matching. Removing the tag from a document is the "decide it again" gesture.
