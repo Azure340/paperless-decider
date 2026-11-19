@@ -14,8 +14,6 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -26,29 +24,12 @@ jobs:
       - name: offline unit tests (fake paperless + fake ollama)
         run: |
           set +e
-          {
-            echo "== tests/test_title_wait.py =="
-            python tests/test_title_wait.py
-            echo "title_wait_exit=$?"
-            echo "== tests/selftest.py =="
-            python tests/selftest.py
-            echo "selftest_exit=$?"
-          } > /tmp/ci-test-log.txt 2>&1
-          cat /tmp/ci-test-log.txt
-          grep -q '^title_wait_exit=0$' /tmp/ci-test-log.txt
-          grep -q '^selftest_exit=0$' /tmp/ci-test-log.txt
-      - name: publish test log to the ci-report branch
-        if: always()
-        run: |
-          test -s /tmp/ci-test-log.txt || exit 0
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git fetch origin ci-report --depth=1 || true
-          git checkout -B ci-report origin/ci-report 2>/dev/null || git checkout --orphan ci-report
-          cp /tmp/ci-test-log.txt ci-test-log.txt
-          git add ci-test-log.txt
-          git commit -m "ci log for run ${{ github.run_number }} at ${{ github.sha }}" || true
-          git push -f origin ci-report
+          python tests/test_title_wait.py
+          titles_exit=$?
+          python tests/selftest.py
+          self_exit=$?
+          echo "test_title_wait exit=$titles_exit  selftest exit=$self_exit"
+          [ "$titles_exit" -eq 0 ] && [ "$self_exit" -eq 0 ]
 
   image:
     needs: test
