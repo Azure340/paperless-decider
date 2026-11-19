@@ -87,10 +87,10 @@ Everything is environment variables. **Never commit `.env`** (it is git-ignored)
 | `POST /decide/sync` | yes | one document, decision applied inline (for manual runs; may take seconds) |
 | `GET /preview/<id>` | **never** | full report with probabilities — the safe way to inspect any document |
 | `GET /status` | never | config + last 100 decisions |
-| `GET /healthz` | never | liveness |
+| `GET /healthz` | never | liveness (the only endpoint that needs no token, for the container healthcheck) |
 
-Requests need `X-Decider-Token: <DECIDER_SHARED_SECRET>` (or `Authorization: Bearer ...`)
-whenever a secret is configured.
+Every endpoint except `/healthz` needs `X-Decider-Token: <DECIDER_SHARED_SECRET>` (or
+`Authorization: Bearer ...`), because `/status` and `/preview` expose document titles.
 
 ## Run it
 
@@ -99,10 +99,11 @@ docker compose up -d      # uses the published image; see docker-compose.yml
 curl -s localhost:8090/healthz
 ```
 
-Tested without any network or model (Python 3.11+, standard library only):
+Verified offline with no network and no model (Python 3.11+, standard library only) —
+31 checks in total, run in CI on every push and PR:
 ```bash
-python3 tests/test_title_wait.py
-python3 tests/selftest.py        # fake paperless + fake Ollama, 14 assertions
+python3 tests/test_title_wait.py     # 10 checks: the title -> tags handoff
+python3 tests/selftest.py            # 21 checks: fake paperless + fake Ollama end to end
 ```
 
 ## paperless setup (two workflows)
@@ -123,8 +124,9 @@ removes data from a document.
 
 ## CI / image
 
-`.github/workflows/build.yml` runs the two offline test suites on every push and PR, then
-builds and pushes a multi-arch image (amd64 + arm64) to GHCR:
+`.github/workflows/build.yml` byte-compiles the code and runs both offline suites on every
+push and PR (output stays in the Actions console log), then builds and pushes a multi-arch
+image (amd64 + arm64) to GHCR:
 
 ```
 ghcr.io/azure340/paperless-decider:latest   # also :main and :sha-<commit>
@@ -136,7 +138,7 @@ credentials: GitHub → your profile → **Packages** → `paperless-decider` �
 
 If the build job fails with a permission error, enable it under
 Settings → Actions → General → Workflow permissions ("Read repository contents and packages
-permissions" is enough).
+permissions" is enough). The workflow needs no write access to the repository itself.
 
 ## Limits worth knowing
 
