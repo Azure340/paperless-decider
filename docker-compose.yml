@@ -16,7 +16,7 @@ services:
       PAPERLESS_API_TOKEN: ${PAPERLESS_API_TOKEN:?set PAPERLESS_API_TOKEN in the stack variables}
       DECIDER_SHARED_SECRET: ${DECIDER_SHARED_SECRET:?set DECIDER_SHARED_SECRET in the stack variables}
       OLLAMA_URL: ${OLLAMA_URL:-http://ollama:11434}
-      DECIDER_MODEL: ${DECIDER_MODEL:-tev1}
+      DECIDER_MODEL: ${DECIDER_MODEL:-tev1:0.8b}
       # ---- what to decide -----------------------------------------------
       DECIDER_FIELDS: ${DECIDER_FIELDS:-tag}
       DECIDER_WAIT_FOR_TITLE: ${DECIDER_WAIT_FOR_TITLE:-true}
@@ -54,6 +54,6 @@ services:
 networks:
   paperless:
     # The network paperless itself is attached to. Find it with:
-    #   docker inspect <paperless-container> --format '{{range $k,$v := .NetworkSettings.Networks}}{{$k}}{{end}}'
+    #   docker inspect <paperless> --format '{{range $k,$v := .NetworkSettings.Networks}}{{$k}}{{end}}'
     name: ${PAPERLESS_NETWORK:-paperless_default}
     external: true
