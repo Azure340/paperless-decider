@@ -114,10 +114,10 @@ curl -s localhost:8090/healthz
 ```
 
 Verified offline with no network and no model (Python 3.11+, standard library only) —
-53 checks in total, run in CI on every push and PR:
+60 checks in total, run in CI on every push and PR:
 ```bash
 python3 tests/test_title_wait.py     # 10 checks: the title -> tags handoff
-python3 tests/selftest.py            # 43 checks: fake paperless + fake Ollama end to end
+python3 tests/selftest.py            # 50 checks: fake paperless + fake Ollama end to end
 ```
 
 ## paperless setup (two workflows)
@@ -139,7 +139,12 @@ The two "has not" conditions are the loop guard: this service adds one of those 
 Workflow 2 stops matching. Removing the tag from a document is the "decide it again" gesture.
 
 Start with `DECIDER_DRY_RUN=true`, read `GET /status`, then switch it off. Nothing here ever
-removes data from a document.
+removes data from a document - and it is worth knowing why that took a bug to guarantee: a
+`tags` PATCH replaces the *whole* list, and paperless returns `tags` as a list of primary
+keys. The sidecar now reads both shapes, re-reads the document immediately before writing
+(the read can be minutes old, because it waited for the AI title), merges, and refuses to
+write at all if it cannot read the current tags. A tag paperless added in the meantime -
+typically an inbox tag - is kept, and `tags_added_by_others` in `/status` says which.
 
 ## CI / image
 

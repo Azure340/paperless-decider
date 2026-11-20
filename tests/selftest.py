@@ -30,6 +30,9 @@ SECRET = "s3cret"
 
 PATCHES = []
 BATCH_SIZES = []
+READS = {}
+LATE_TAGS = []
+LATE_FIELD = []
 
 TAGS = [
     {"id": 1, "name": "Insurance", "document_count": 40},
@@ -68,7 +71,9 @@ DOCUMENT = {
         "Betrag 104,99 EUR faellig bis 30.11.2026. "
         "Insurance invoice for the car policy renewal. Payment due month end. "
     ),
-    "tags": [{"id": 2}],
+    # paperless returns tag PRIMARY KEYS, not objects. The fake used to return
+    # [{"id": 2}], which agreed with a broken reader and hid a data-loss bug.
+    "tags": [2],
     "correspondent": None,
     "document_type": None,
     "storage_path": 30,
@@ -94,9 +99,22 @@ class FakePaperless(BaseHTTPRequestHandler):
     def do_GET(self):
         path = urllib.parse.urlparse(self.path).path
         if path == "/api/documents/77/":
-            return self._send(200, DOCUMENT)
+            READS["77"] = READS.get("77", 0) + 1
+            if READS["77"] == 1:
+                return self._send(200, DOCUMENT)
+            late = dict(DOCUMENT)
+            late["tags"] = list(DOCUMENT["tags"]) + list(LATE_TAGS)
+            if LATE_FIELD:
+                late[LATE_FIELD[0]] = LATE_FIELD[1]
+            return self._send(200, late)
         if path == "/api/documents/78/":
             return self._send(200, {"id": 78, "title": "blank scan", "content": "", "tags": []})
+        if path == "/api/documents/80/":
+            # a payload without a tags field at all: writing would be a blind replace
+            return self._send(200, {"id": 80, "title": "no tags key", "content": DOCUMENT["content"]})
+        if path == "/api/documents/79/":
+            # a document whose tags are objects, the shape some payloads use
+            return self._send(200, dict(DOCUMENT, id=79, tags=[{"id": 2}]))
         if path.startswith("/api/documents/"):
             return self._send(404, {"error": "not found"})
         for prefix, items in (
@@ -607,6 +625,75 @@ def main():
         "GET /status reports the skip list so it can be verified live",
         status.get("skip_tags") == [],
         str(status.get("skip_tags")),
+    )
+
+    # ---- a write must only ever ADD ----
+    check(
+        "tag_ids() reads paperless' real shape (a list of primary keys)",
+        decider.tag_ids({"tags": [3, 24]}) == set([3, 24])
+        and decider.tag_ids({"tags": [{"id": 3}]}) == set([3])
+        and decider.tag_ids({}) is None,
+        str(decider.tag_ids({"tags": [3, 24]})),
+    )
+
+    patch_before = len(PATCHES)
+    kept = decider.process_document(79, cfg, pl, ollama)
+    kept_patch = PATCHES[-1]["body"] if len(PATCHES) > patch_before else {}
+    dry_first = decider.process_document(77, dataclasses.replace(cfg, dry_run=True), pl, ollama)
+    check(
+        "the first read itself understands paperless' integer tag list",
+        2 in (dry_first.get("would_patch", {}).get("tags") or []),
+        str(dry_first.get("would_patch")),
+    )
+    check(
+        "object-shaped tags are preserved too, not just primary keys",
+        2 in (kept_patch.get("tags") or []) and 1 in (kept_patch.get("tags") or []),
+        str(kept_patch) + " " + str(kept.get("result")),
+    )
+
+    # paperless adds the inbox tag while the sidecar waits for the AI title; the
+    # write must not delete it again (this is exactly what happened on document 1334)
+    LATE_TAGS[:] = [{"id": 24}]
+    READS.clear()
+    patch_before = len(PATCHES)
+    raced = decider.process_document(77, cfg, pl, ollama)
+    raced_patch = PATCHES[-1]["body"] if len(PATCHES) > patch_before else {}
+    check(
+        "the write re-reads the document first",
+        READS.get("77", 0) == 2,
+        str(READS.get("77")),
+    )
+    check(
+        "a tag paperless added during the wait survives the write",
+        24 in (raced_patch.get("tags") or []) and 1 in (raced_patch.get("tags") or []),
+        str(raced_patch),
+    )
+    check(
+        "and the report says which tags came from somewhere else",
+        raced.get("tags_added_by_others") == [24],
+        str(raced.get("tags_added_by_others")),
+    )
+    del LATE_TAGS[:]
+
+    LATE_FIELD[:] = ["correspondent", 11]
+    READS.clear()
+    patch_before = len(PATCHES)
+    human = decider.process_document(77, cfg, pl, ollama)
+    human_patch = PATCHES[-1]["body"] if len(PATCHES) > patch_before else {}
+    check(
+        "a correspondent a human set during the wait is not overwritten",
+        "correspondent" not in human_patch
+        and "correspondent" in (human.get("skipped_stale_fields") or []),
+        str(human_patch) + " " + str(human.get("skipped_stale_fields")),
+    )
+    del LATE_FIELD[:]
+
+    refused = decider.process_document(80, cfg, pl, ollama)
+    check(
+        "a document whose tags cannot be read is never written",
+        "refusing to write" in str(refused.get("skipped", ""))
+        and "would_patch" not in refused,
+        str(refused)[:220],
     )
 
     for httpd in fakes + [sidecar]:

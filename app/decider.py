@@ -52,6 +52,10 @@ TAXONOMY_ENDPOINTS = {
 }
 NONE_KEY = "cnone"
 MIN_TOKEN_LENGTH = 3
+# paperless' DocumentSerializer.tags is a list of primary keys ([3, 24]); older and
+# hand-built payloads use objects ([{"id": 3}]). Both are accepted, because guessing
+# wrong here means the PATCH silently deletes the tags of a real document.
+TAG_LIST_FIELDS = ("tags",)
 WARNED_MISSING_SKIP = set()
 
 
@@ -629,6 +633,26 @@ def shortlist(candidates, text, limit, exclude=frozenset()):
     return [item for _score, _count, item in scored[:limit]]
 
 
+def tag_ids(doc, key="tags"):
+    """Tag ids on a document, from either shape paperless can return.
+
+    Returns None (not an empty set) when the field is missing entirely, so a caller
+    can tell 'no tags' apart from 'I could not read the tags'.
+    """
+    raw = doc.get(key)
+    if raw is None:
+        return None
+    ids = set()
+    for entry in raw:
+        if isinstance(entry, dict):
+            entry = entry.get("id")
+        try:
+            ids.add(int(entry))
+        except (TypeError, ValueError):
+            continue
+    return ids
+
+
 def document_stem(doc):
     filename = str(doc.get("original_file_name") or doc.get("filename") or "")
     return normalize(os.path.splitext(os.path.basename(filename))[0])
@@ -855,9 +879,13 @@ def process_document(doc_id, cfg, pl, ollama):
         return report
 
     state = build_state(doc, cfg.max_state_chars)
-    existing_tags = sorted(
-        int(tag["id"]) for tag in (doc.get("tags") or []) if isinstance(tag, dict) and "id" in tag
-    )
+    existing_set = tag_ids(doc)
+    if existing_set is None:
+        # Without this the write below would replace the whole list with only what
+        # the model picked, i.e. delete the document's existing tags.
+        report["skipped"] = "document had no readable tags field - refusing to write"
+        return report
+    existing_tags = sorted(existing_set)
 
     payload = {}
     decisions = report["decisions"]
@@ -916,6 +944,38 @@ def process_document(doc_id, cfg, pl, ollama):
         return report
     if cfg.dry_run:
         report["result"] = "dry run"
+        return report
+
+    # The read above can be minutes old (we waited for the AI title first), and a tags
+    # PATCH replaces the whole list. Re-read and merge so this write can only ADD -
+    # anything paperless did in the meantime (inbox tags, a human edit, the classifier)
+    # has to survive it.
+    try:
+        fresh = pl.document(doc_id)
+    except HTTPProblem as exc:
+        if exc.status == 404:
+            report["skipped"] = "document disappeared before the write"
+            report["result"] = "nothing to apply"
+            return report
+        raise
+    now_tags = tag_ids(fresh)
+    if now_tags is None:
+        report["skipped"] = "re-read had no readable tags field - refusing to write"
+        report["result"] = "nothing to apply"
+        return report
+    if "tags" in payload:
+        merged = sorted(now_tags | set(payload["tags"]))
+        report["tags_added_by_others"] = sorted(now_tags - set(payload["tags"]))
+        if merged == sorted(now_tags):
+            payload.pop("tags")
+        else:
+            payload["tags"] = merged
+    for field in SINGLE_FIELDS:
+        if field in payload and fresh.get(field) not in (None, ""):
+            payload.pop(field)
+            report.setdefault("skipped_stale_fields", []).append(field)
+    if not payload:
+        report["result"] = "nothing to apply after re-read"
         return report
 
     pl.patch_document(doc_id, payload)
