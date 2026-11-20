@@ -114,10 +114,10 @@ curl -s localhost:8090/healthz
 ```
 
 Verified offline with no network and no model (Python 3.11+, standard library only) —
-60 checks in total, run in CI on every push and PR:
+61 checks in total, run in CI on every push and PR:
 ```bash
 python3 tests/test_title_wait.py     # 10 checks: the title -> tags handoff
-python3 tests/selftest.py            # 50 checks: fake paperless + fake Ollama end to end
+python3 tests/selftest.py            # 51 checks: fake paperless + fake Ollama end to end
 ```
 
 ## paperless setup (two workflows)
