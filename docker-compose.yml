@@ -33,6 +33,8 @@ services:
       DECIDER_REVIEW_TAG: ${DECIDER_REVIEW_TAG:-needs-review}
       DECIDER_DONE_TAG: ${DECIDER_DONE_TAG:-auto-tagged}
       DECIDER_REVIEW_ON_NO_TAGS: ${DECIDER_REVIEW_ON_NO_TAGS:-true}
+      # Tags that are workflow state rather than subject matter (e.g. an inbox tag).
+      DECIDER_SKIP_TAGS: ${DECIDER_SKIP_TAGS:-}
       # ---- inference plumbing / limits ---------------------------------
       DECIDER_TIMEOUT: ${DECIDER_TIMEOUT:-60}
       DECIDER_KEEP_ALIVE: ${DECIDER_KEEP_ALIVE:-15m}

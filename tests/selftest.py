@@ -270,6 +270,7 @@ def main():
             "DECIDER_MAX_TAG_OPTIONS": "3",
             "DECIDER_MAX_SINGLE_OPTIONS": "10",
             "DECIDER_MIN_CONTENT_CHARS": "80",
+            "DECIDER_SKIP_TAGS": "",
             "DECIDER_HOST": "127.0.0.1",
             "DECIDER_PORT": str(SIDECAR_PORT),
             "DECIDER_LOG_LEVEL": "CRITICAL",
@@ -387,6 +388,33 @@ def main():
         decider.marker_tag_ids(dataclasses.replace(cfg, review_tag="", done_tag=""), pl) == set(),
     )
 
+    # ---- DECIDER_SKIP_TAGS ----
+    skip_cfg = dataclasses.replace(cfg, skip_tags=("Health", "no-such-tag-name"))
+    skipped = [d.label for d in decider.decide_tags(skip_cfg, pl, ollama, DOCUMENT["content"], set())]
+    check(
+        "DECIDER_SKIP_TAGS keeps a named tag out of the candidates",
+        "Health" not in skipped and "Insurance" in skipped,
+        str(skipped),
+    )
+    check(
+        "skipped tags and bookkeeping tags are excluded together",
+        set(skipped) == set(["Car", "Insurance", "Urgent"]),
+        str(skipped),
+    )
+    os.environ["DECIDER_SKIP_TAGS"] = "Inbox, Back up,Misc"
+    parsed = decider.Config.from_env().skip_tags
+    os.environ["DECIDER_SKIP_TAGS"] = ""
+    check(
+        "DECIDER_SKIP_TAGS parses as a comma separated list",
+        parsed == ("Inbox", "Back up", "Misc"),
+        str(parsed),
+    )
+    check(
+        "an unknown skip name is warned about, not ignored silently",
+        "no-such-tag-name" in decider.WARNED_MISSING_SKIP,
+        str(sorted(decider.WARNED_MISSING_SKIP)),
+    )
+
     # ---- an inference server that dies mid-request ----
     crash_server = serve(FakeCrashOllama)
     crash_cfg = dataclasses.replace(
@@ -486,6 +514,11 @@ def main():
     )
     status = read_json(base + "/status", auth)
     check("GET /status exposes recent results", bool(status.get("last_results")), str(status)[:160])
+    check(
+        "GET /status reports the skip list so it can be verified live",
+        status.get("skip_tags") == [],
+        str(status.get("skip_tags")),
+    )
 
     for httpd in fakes + [sidecar]:
         httpd.shutdown()

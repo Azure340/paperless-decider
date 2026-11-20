@@ -82,6 +82,7 @@ Everything is environment variables. **Never commit `.env`** (it is git-ignored)
 | `DECIDER_REVIEW_TAG` | empty | tag applied when a field could not be decided confidently |
 | `DECIDER_DONE_TAG` | empty | tag applied when everything was decided; also the loop guard |
 | `DECIDER_REVIEW_ON_NO_TAGS` | `false` | send documents that matched no tag to review instead of filing blank |
+| `DECIDER_SKIP_TAGS` | empty | comma-separated tag names never offered as candidates (workflow-state tags, e.g. `inbox`) |
 | `DECIDER_MIN_CONTENT_CHARS` | `80` | skip blank scans (they used to inherit a neighbour's metadata) |
 | `DECIDER_MAX_STATE_CHARS` | `6000` | how much document text the model reads |
 | `DECIDER_KEEP_ALIVE` | `10m` | passed to Ollama so the model stays loaded |
@@ -110,10 +111,10 @@ curl -s localhost:8090/healthz
 ```
 
 Verified offline with no network and no model (Python 3.11+, standard library only) —
-38 checks in total, run in CI on every push and PR:
+43 checks in total, run in CI on every push and PR:
 ```bash
 python3 tests/test_title_wait.py     # 10 checks: the title -> tags handoff
-python3 tests/selftest.py            # 28 checks: fake paperless + fake Ollama end to end
+python3 tests/selftest.py            # 33 checks: fake paperless + fake Ollama end to end
 ```
 
 ## paperless setup (two workflows)
@@ -161,6 +162,9 @@ permissions" is enough). The workflow needs no write access to the repository it
   (that stays the LLM's job).
 - Two near-duplicate labels (`Rechnung` next to `Invoice`) cannot be separated by probability.
   Merge them.
+- Tags that are really workflow state - an `inbox` tag, `scanned`, `review` - are questions the
+  model answers badly, because the *name* looks like a subject. Put them in `DECIDER_SKIP_TAGS`
+  and they are never offered; `DECIDER_REVIEW_TAG`/`DECIDER_DONE_TAG` are excluded automatically.
 - Your `DECIDER_REVIEW_TAG` / `DECIDER_DONE_TAG` markers are never offered to the model - that
   service bookkeeping is not a subject a document can be about. Without the exclusion the
   model answers "Is this document about needs-review?" (measured live: p=0.79 on an

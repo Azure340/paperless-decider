@@ -52,6 +52,7 @@ TAXONOMY_ENDPOINTS = {
 }
 NONE_KEY = "cnone"
 MIN_TOKEN_LENGTH = 3
+WARNED_MISSING_SKIP = set()
 
 
 class ConfigError(RuntimeError):
@@ -130,6 +131,7 @@ class Config:
     review_tag: str
     review_on_no_tags: bool
     done_tag: str
+    skip_tags: tuple
     dry_run: bool
     taxonomy_ttl: int
     workers: int
@@ -171,6 +173,7 @@ class Config:
             review_tag=_s("DECIDER_REVIEW_TAG"),
             review_on_no_tags=_b("DECIDER_REVIEW_ON_NO_TAGS", False),
             done_tag=_s("DECIDER_DONE_TAG"),
+            skip_tags=tuple(_csv("DECIDER_SKIP_TAGS", "")),
             dry_run=_b("DECIDER_DRY_RUN", False),
             taxonomy_ttl=_i("DECIDER_TAXONOMY_TTL", 300),
             workers=max(1, _i("DECIDER_WORKERS", 1)),
@@ -634,8 +637,38 @@ def marker_tag_ids(cfg, pl):
     return ids
 
 
+def skip_tag_ids(cfg, pl):
+    """Ids for DECIDER_SKIP_TAGS: taxonomy entries that must never be subjects.
+
+    The bookkeeping tags are handled by marker_tag_ids; this covers the rest -
+    above all an `inbox` tag. Without it the model gets asked "Is this document
+    about inbox?", and an affirmative answer re-files a document the human just
+    cleared out of the review view. Names are matched accent/case-insensitively;
+    one that matches nothing is warned about once, because a silent typo here
+    would leave exactly the tag you meant to protect in play.
+    """
+    wanted = {normalize(name) for name in cfg.skip_tags} - {""}
+    if not wanted:
+        return set()
+    ids = set()
+    seen = set()
+    for tag in pl.taxonomy("tag"):
+        name = normalize(str(tag.get("name", "")))
+        if name in wanted:
+            seen.add(name)
+            try:
+                ids.add(int(tag["id"]))
+            except (TypeError, ValueError, KeyError):
+                continue
+    for missing in sorted(wanted - seen):
+        if missing not in WARNED_MISSING_SKIP:
+            WARNED_MISSING_SKIP.add(missing)
+            LOG.warning("DECIDER_SKIP_TAGS entry %r matches no visible tag name", missing)
+    return ids
+
+
 def decide_tags(cfg, pl, ollama, state, current_tag_ids):
-    blocked = set(current_tag_ids) | marker_tag_ids(cfg, pl)
+    blocked = set(current_tag_ids) | marker_tag_ids(cfg, pl) | skip_tag_ids(cfg, pl)
     candidates = shortlist(pl.taxonomy("tag"), state, cfg.max_tag_options, exclude=blocked)
     decisions = []
     for cand in candidates:
@@ -982,6 +1015,7 @@ class Handler(BaseHTTPRequestHandler):
                     "model": self.cfg.model,
                     "thresholds": {"single": self.cfg.thresh_single, "tag": self.cfg.thresh_tag},
                     "options": {"single": self.cfg.max_single_options, "tag": self.cfg.max_tag_options},
+                    "skip_tags": list(self.cfg.skip_tags),
                     "last_results": list(RESULTS)[:15],
                 },
             )
@@ -1029,6 +1063,8 @@ def main():
         )
     elif caps:
         LOG.info("model %s capabilities: %s", cfg.model, ",".join(caps))
+    if cfg.skip_tags:
+        LOG.info("never offered as tag candidates: %s", ",".join(cfg.skip_tags))
 
     worker = Worker(cfg, pl, ollama)
     for index in range(cfg.workers):
