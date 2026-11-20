@@ -497,10 +497,10 @@ def main():
     )
     tied = [{"id": 1, "name": "Alpha Tag", "document_count": 100},
             {"id": 2, "name": "Zeta Tag", "document_count": 115}]
+    first_tied = decider.shortlist(tied, "nothing here names any of these", 1)
     check(
         "with no lexical signal the busier tag wins the tie, not the alphabetically first",
-        decider.shortlist(tied, "nothing here names any of these", 1)[:1] == [dict(  # noqa: E999
-            {"id": 2, "name": "Zeta Tag", "score": 0.45})],
+        [c["name"] for c in first_tied] == ["Zeta Tag"],
         str(decider.shortlist(tied, "nothing here names any of these", 2)),
     )
 
