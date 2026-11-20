@@ -549,12 +549,22 @@ def main():
         [d.label for d in one] == [d.label for d in chunked],
         str([d.label for d in one]) + " vs " + str([d.label for d in chunked]),
     )
+    many = [str(n) for n in range(12)]
+    check(
+        "question_batches: 0 means one request even past a chunk size of 10",
+        decider.question_batches(default_cfg, many) == [many],
+        str([len(c) for c in decider.question_batches(default_cfg, many)]),
+    )
+    check(
+        "question_batches: a positive value splits at that size",
+        [len(c) for c in decider.question_batches(
+            dataclasses.replace(default_cfg, questions_per_request=5), many)] == [5, 5, 2],
+    )
     check(
         "question_batches always returns a usable plan",
         decider.question_batches(default_cfg, []) == [[]]
         and decider.question_batches(dataclasses.replace(default_cfg, questions_per_request=1),
-                                     ["a", "b"]) == [["a"], ["b"]]
-        and decider.question_batches(default_cfg, ["a", "b"]) == [["a", "b"]],
+                                     ["a", "b"]) == [["a"], ["b"]],
     )
 
     # ---- an inference server that dies mid-request ----
