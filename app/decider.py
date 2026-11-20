@@ -127,6 +127,8 @@ class Config:
     thresh_tag: float
     max_single_options: int
     max_tag_options: int
+    questions_per_request: int
+    grey_zone: float
     overwrite: bool
     review_tag: str
     review_on_no_tags: bool
@@ -168,7 +170,11 @@ class Config:
             thresh_single=_f("DECIDER_THRESH_SINGLE", 0.85),
             thresh_tag=_f("DECIDER_THRESH_TAG", 0.80),
             max_single_options=min(25, _i("DECIDER_MAX_SINGLE_OPTIONS", 20)),
-            max_tag_options=min(25, _i("DECIDER_MAX_TAG_OPTIONS", 8)),
+            # 0 (the default) = ask about EVERY tag. Ranking stays as the order to ask
+            # in and as the knob that re-introduces a shortlist if you set it > 0.
+            max_tag_options=max(0, min(25, _i("DECIDER_MAX_TAG_OPTIONS", 0))),
+            questions_per_request=max(1, min(25, _i("DECIDER_QUESTIONS_PER_REQUEST", 10))),
+            grey_zone=_f("DECIDER_GREY_ZONE", 0.03),
             overwrite=_b("DECIDER_OVERWRITE", False),
             review_tag=_s("DECIDER_REVIEW_TAG"),
             review_on_no_tags=_b("DECIDER_REVIEW_ON_NO_TAGS", False),
@@ -215,6 +221,8 @@ class Config:
         for name in ("thresh_single", "thresh_tag"):
             if not 0.0 < getattr(self, name) <= 1.0:
                 raise ConfigError(name + " must be in (0, 1]")
+        if not 0.0 <= self.grey_zone < 0.5:
+            raise ConfigError("grey_zone must be in [0, 0.5)")
         if self.title_poll_seconds <= 0:
             raise ConfigError("DECIDER_TITLE_POLL_SECONDS must be positive")
         if self.title_poll_tries < 1:
@@ -386,17 +394,23 @@ class Ollama:
     def __init__(self, cfg):
         self.cfg = cfg
 
-    def _systemone(self, state, question):
-        """Ask exactly one question per request.
+    def _ask(self, state, questions):
+        """One /v1/systemone request carrying one or more typed questions.
 
-        Batching questions is cheaper but their option sets influence each other's
-        probabilities (measured on Ollama 0.35), which would make the threshold
-        policy meaningless.
+        Batching is not free of cost for accuracy: asking fifty noul questions in a
+        single request shifts each probability a little, because the questions share a
+        forward pass. Measured on Ollama 0.40.16 + tev1:0.8b against this archive, the
+        shift is mean 0.002 / worst 0.014 - which is nothing except right next to a
+        threshold, where it is decisive. So the batch is the cheap first pass and
+        anything within grey_zone of the threshold is asked again on its own, solo, in
+        _ask({'q': ...}) form. What is bought: the document is prefilled once per
+        request instead of once per tag (50 tags batched ~10-20 s, versus ~7-21 s for
+        just 8 tags asked one at a time).
         """
         body = {
             "model": self.cfg.model,
             "state": state,
-            "questions": {"q": question},
+            "questions": questions,
             "keep_alive": self.cfg.keep_alive,
         }
         last = None
@@ -410,10 +424,13 @@ class Ollama:
                 )
                 if not isinstance(response, dict):
                     raise DecisionError("empty systemone response")
-                answer = (response.get("answers") or {}).get("q")
-                if not isinstance(answer, dict):
-                    raise DecisionError("no answer in response: " + json.dumps(response)[:200])
-                return answer
+                answers = response.get("answers")
+                if not isinstance(answers, dict):
+                    raise DecisionError("no answers in response: " + json.dumps(response)[:200])
+                missing = sorted(key for key in questions if not isinstance(answers.get(key), dict))
+                if missing:
+                    raise DecisionError("no answer for " + ",".join(missing))
+                return answers
             except (HTTPProblem, DecisionError) as exc:
                 last = exc
                 # A 4xx is a configuration problem; retrying only burns time.
@@ -425,7 +442,48 @@ class Ollama:
             "systemone failed after " + str(self.cfg.retries + 1) + " attempts: " + str(last)
         )
 
+    def _systemone(self, state, question):
+        """A single question, solo - the authoritative form near a threshold."""
+        return self._ask(state, {"q": question})["q"]
+
+    def noul_many(self, state, labels):
+        """One request, one noul question per label -> {label: probability}.
+
+        Returns {} if the batch could not be answered at all. The caller then asks each
+        label solo, which is slower but never wrong: a batching optimisation must not
+        be able to lose a document its tags.
+        """
+        if not labels:
+            return {}
+        questions = {
+            "n%d" % index: {
+                "type": "noul",
+                "instructions": self.cfg.q_tag.replace("{label}", label),
+                "criteria": {
+                    "false": "The document is not about " + label + ".",
+                    "true": "The document is about " + label + ".",
+                },
+            }
+            for index, label in enumerate(labels)
+        }
+        try:
+            answers = self._ask(state, questions)
+        except DecisionError as exc:
+            LOG.warning("batched questions failed, asking one at a time: %s", exc)
+            return {}
+        out = {}
+        for index, label in enumerate(labels):
+            try:
+                out[label] = float(answers["n%d" % index].get("noul"))
+            except (KeyError, TypeError, ValueError, AttributeError):
+                continue
+        return out
+
     def choice(self, state, instructions, options):
+        # Single-label by construction, and capped at 26 options by the API: this is
+        # the right question for correspondent / document_type / storage_path, never
+        # for tags - a contest dilutes the winner (US Taxes read 0.9876 solo as a
+        # yes/no, but only 0.7448 as the winner of a 27-option choice).
         answer = self._systemone(
             state,
             {"type": "choice", "instructions": instructions, "criteria": options},
@@ -529,10 +587,15 @@ def stem(word):
 def shortlist(candidates, text, limit, exclude=frozenset()):
     """Rank taxonomy entries against the document and keep the top `limit`.
 
-    /v1/systemone accepts 2-26 options, so a large archive has to be narrowed
-    before asking. Signal, strongest first: the entry's full name occurs verbatim
-    in the document, its words overlap the document's words, and (weakly) how
-    often it is used elsewhere in the archive.
+    `limit=None` keeps every candidate: asked tags are batched now, so ranking is no
+    longer a budget that decides which tags get considered at all - it only decides the
+    order. That is deliberate. While ranking was a budget, a lexical miss silently cost
+    documents their correct tag ("US Taxes" at p=0.9876, never asked, because nothing in
+    a 690-character IRS letter contains the string "us taxes").
+
+    Signal, strongest first: the entry's full name occurs verbatim in the document, its
+    stem-matched words overlap the document's words, and (weakly) how often it is used
+    elsewhere in the archive.
     """
     norm_text = normalize(text)
     doc_tokens = {stem(word) for word in tokenize(text)}
@@ -687,23 +750,57 @@ def skip_tag_ids(cfg, pl):
     return ids
 
 
-def decide_tags(cfg, pl, ollama, state, current_tag_ids):
-    blocked = set(current_tag_ids) | marker_tag_ids(cfg, pl) | skip_tag_ids(cfg, pl)
-    candidates = shortlist(pl.taxonomy("tag"), state, cfg.max_tag_options, exclude=blocked)
-    decisions = []
-    for cand in candidates:
-        label = cand["name"]
-        decision = ollama.noul(
+def ask_tag_probabilities(cfg, ollama, state, labels):
+    """Probability per label, in as few requests as possible.
+
+    Returns {label: (probability, re_asked_alone)}. A label is re-asked solo when the
+    batch has no answer for it, and when its batched number sits within grey_zone of
+    the threshold - that is the only band where the batching shift can flip a decision,
+    and a flip there is a silent wrong answer.
+    """
+    def ask_alone(label):
+        return ollama.noul(
             state,
             cfg.q_tag.replace("{label}", label),
             "The document is about " + label + ".",
             "The document is not about " + label + ".",
-        )
+        ).probability
+
+    probs = {}
+    if cfg.questions_per_request > 1:
+        for start in range(0, len(labels), cfg.questions_per_request):
+            chunk = labels[start:start + cfg.questions_per_request]
+            probs.update(ollama.noul_many(state, chunk))
+    reasked = set()
+    for label in labels:
+        if label not in probs:
+            probs[label] = ask_alone(label)
+        elif cfg.grey_zone and abs(probs[label] - cfg.thresh_tag) <= cfg.grey_zone:
+            probs[label] = ask_alone(label)
+            reasked.add(label)
+    return {label: (probs.get(label, 0.0), label in reasked) for label in labels}
+
+
+def decide_tags(cfg, pl, ollama, state, current_tag_ids):
+    blocked = set(current_tag_ids) | marker_tag_ids(cfg, pl) | skip_tag_ids(cfg, pl)
+    candidates = shortlist(pl.taxonomy("tag"), state, cfg.max_tag_options or None,
+                           exclude=blocked)
+    labels = [cand['name'] for cand in candidates]
+    scored = ask_tag_probabilities(cfg, ollama, state, labels)
+    decisions = []
+    for cand in candidates:
+        label = cand["name"]
+        probability, re_asked = scored.get(label, (0.0, False))
+        decision = Decision(kind="noul", probability=probability, confidence=probability)
         decision.key = "tag:" + str(cand["id"])
         decision.label = label
         decision.object_id = cand["id"]
-        if decision.probability < cfg.thresh_tag:
-            decision.note = "below threshold %.2f" % cfg.thresh_tag
+        notes = []
+        if re_asked:
+            notes.append("near threshold in batch, re-asked alone")
+        if probability < cfg.thresh_tag:
+            notes.append("below threshold %.2f" % cfg.thresh_tag)
+        decision.note = "; ".join(notes)
         decisions.append(decision)
     return decisions
 
@@ -1035,6 +1132,8 @@ class Handler(BaseHTTPRequestHandler):
                     "model": self.cfg.model,
                     "thresholds": {"single": self.cfg.thresh_single, "tag": self.cfg.thresh_tag},
                     "options": {"single": self.cfg.max_single_options, "tag": self.cfg.max_tag_options},
+                    "questions_per_request": self.cfg.questions_per_request,
+                    "grey_zone": self.cfg.grey_zone,
                     "skip_tags": list(self.cfg.skip_tags),
                     "last_results": list(RESULTS)[:15],
                 },
@@ -1110,7 +1209,7 @@ def main():
     signal.signal(signal.SIGINT, shutdown)
     LOG.info(
         "listening on %s:%s | fields=%s thresh(single=%.2f tag=%.2f) overwrite=%s "
-        "dry_run=%s wait_for_title=%s model=%s auth=%s",
+        "dry_run=%s wait_for_title=%s model=%s auth=%s tags_asked=%s questions_per_request=%d grey_zone=%.3f",
         cfg.host,
         cfg.port,
         ",".join(cfg.fields),
@@ -1121,6 +1220,9 @@ def main():
         cfg.wait_for_title,
         cfg.model,
         "token" if cfg.secret else "OPEN",
+        "all" if not cfg.max_tag_options else cfg.max_tag_options,
+        cfg.questions_per_request,
+        cfg.grey_zone,
     )
     try:
         httpd.serve_forever()

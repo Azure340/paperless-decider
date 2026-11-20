@@ -29,12 +29,14 @@ OLLAMA_CRASH_PORT = 18102
 SECRET = "s3cret"
 
 PATCHES = []
+BATCH_SIZES = []
 
 TAGS = [
     {"id": 1, "name": "Insurance", "document_count": 40},
     {"id": 2, "name": "Car", "document_count": 30},
     {"id": 3, "name": "Health", "document_count": 25},
     {"id": 4, "name": "Urgent", "document_count": 3},
+    {"id": 5, "name": "Pets", "document_count": 2},
     {"id": 90, "name": "ai-review", "document_count": 1},
 ]
 CORRESPONDENTS = [
@@ -159,14 +161,24 @@ class FakeOllama(BaseHTTPRequestHandler):
         if path != "/v1/systemone":
             return self._send(404, {"error": "no such endpoint"})
         questions = body.get("questions") or {}
-        if len(questions) != 1:
-            return self._send(400, {"error": "this fake answers one question at a time"})
-        question = questions["q"]
+        if not questions:
+            return self._send(400, {"error": "no questions"})
+        BATCH_SIZES.append(len(questions))
+        batched = len(questions) > 1
+        answers = {key: self._answer(question, batched) for key, question in questions.items()}
+        return self._send(200, {"answers": answers, "usage": {"input_tokens": 220, "output_tokens": 0}})
+
+    def _answer(self, question, batched):
         instructions = question.get("instructions", "")
         criteria = question.get("criteria") or {}
         if question.get("type") == "noul":
+            if "Pets" in instructions:
+                # Deliberately straddles DECIDER_THRESH_TAG=0.80: read 0.78 when asked
+                # in a batch, 0.86 when asked alone. Only the grey-zone re-ask turns
+                # that into an apply, so these two numbers make the behaviour visible.
+                return {"type": "noul", "noul": 0.78 if batched else 0.86}
             prob = 0.93 if "Insurance" in instructions else 0.08
-            return self._send(200, {"answers": {"q": {"type": "noul", "noul": prob}}})
+            return {"type": "noul", "noul": prob}
 
         lowered = instructions.lower()
         if "correspondent" in lowered:
@@ -181,20 +193,12 @@ class FakeOllama(BaseHTTPRequestHandler):
             key = next(k for k, v in criteria.items() if v == winner)
         probabilities = dict.fromkeys(criteria, 0.01)
         probabilities[key] = prob
-        return self._send(
-            200,
-            {
-                "answers": {
-                    "q": {
-                        "type": "choice",
-                        "choice": key,
-                        "probabilities": probabilities,
-                        "confidence": prob,
-                    },
-                },
-                "usage": {"input_tokens": 220, "output_tokens": 0},
-            },
-        )
+        return {
+            "type": "choice",
+            "choice": key,
+            "probabilities": probabilities,
+            "confidence": prob,
+        }
 
     def log_message(self, *args):
         pass
@@ -375,7 +379,7 @@ def main():
     )
     check(
         "real taxonomy tags are still offered (nothing over-blocked)",
-        set(["Insurance", "Car", "Health", "Urgent"]) == set(offered),
+        set(["Insurance", "Car", "Health", "Urgent", "Pets"]) == set(offered),
         str(offered),
     )
     check(
@@ -398,6 +402,8 @@ def main():
     )
     check(
         "skipped tags and bookkeeping tags are excluded together",
+        # skip_cfg keeps the env shortlist of 3, so `Pets` is legitimately absent here:
+        # this check is about what got blocked, not about ask-all coverage.
         set(skipped) == set(["Car", "Insurance", "Urgent"]),
         str(skipped),
     )
@@ -413,6 +419,52 @@ def main():
         "an unknown skip name is warned about, not ignored silently",
         "no-such-tag-name" in decider.WARNED_MISSING_SKIP,
         str(sorted(decider.WARNED_MISSING_SKIP)),
+    )
+
+    # ---- batching, ask-all and the grey zone ----
+    all_cfg = dataclasses.replace(cfg, max_tag_options=0)
+    asked_all = [d.label for d in decider.decide_tags(all_cfg, pl, ollama, DOCUMENT["content"], set())]
+    check(
+        "max_tag_options=0 asks about every visible tag, not a shortlist",
+        set(asked_all) == set(["Insurance", "Car", "Health", "Urgent", "Pets"]),
+        str(asked_all),
+    )
+    check(
+        "a tag only reachable outside the shortlist still gets applied",
+        "Pets" in asked_all
+        and any(d.label == "Pets" and d.probability >= 0.80 for d in
+                 decider.decide_tags(all_cfg, pl, ollama, DOCUMENT["content"], set())),
+        str(asked_all),
+    )
+    check(
+        "questions really go out batched, several per request",
+        bool(BATCH_SIZES) and max(BATCH_SIZES) > 1,
+        str(BATCH_SIZES[-8:]),
+    )
+    pets = [d for d in decider.decide_tags(all_cfg, pl, ollama, DOCUMENT["content"], set())
+            if d.label == "Pets"][0]
+    check(
+        "a batched answer near the threshold is re-asked alone and the solo number wins",
+        pets.probability == 0.86 and "re-asked alone" in pets.note,
+        str(pets.as_dict()),
+    )
+    strict = dataclasses.replace(all_cfg, grey_zone=0.0)
+    pets_strict = [d for d in decider.decide_tags(strict, pl, ollama, DOCUMENT["content"], set())
+                   if d.label == "Pets"][0]
+    check(
+        "grey_zone=0 disables the re-ask (batched 0.78 stays refused at 0.80)",
+        pets_strict.probability == 0.78 and pets_strict.object_id is not None
+        and "below threshold" in pets_strict.note,
+        str(pets_strict.as_dict()),
+    )
+    solo = dataclasses.replace(all_cfg, questions_per_request=1)
+    solo_before = len(BATCH_SIZES)
+    solo_pets = [d for d in decider.decide_tags(solo, pl, ollama, DOCUMENT["content"], set())
+                 if d.label == "Pets"][0]
+    check(
+        "questions_per_request=1 restores the old one-question-per-request mode",
+        max(BATCH_SIZES[solo_before:]) == 1 and solo_pets.probability == 0.86,
+        str(BATCH_SIZES[solo_before:]),
     )
 
     # ---- shortlist recall: stems and tie-breaks ----
