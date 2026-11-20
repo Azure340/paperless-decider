@@ -509,6 +509,23 @@ def tokenize(text):
     }
 
 
+STEM_SUFFIXES = ("ations", "ation", "ments", "ment", "ings", "ing", "ies", "es", "s")
+
+
+def stem(word):
+    """A cheap English lemma key so `taxes` matches `tax` and `licenses` `licensing`.
+
+    Deliberately dumb - one suffix stripped, stem kept at 3+ characters - and applied to
+    tag names and document words alike, so a wrong guess is symmetric: it stops matching
+    rather than matching something unrelated.
+    """
+    for suffix in STEM_SUFFIXES:
+        if word.endswith(suffix) and len(word) - len(suffix) >= 3:
+            base = word[: -len(suffix)] + ("y" if suffix == "ies" else "")
+            return base if len(base) >= 3 else word
+    return word
+
+
 def shortlist(candidates, text, limit, exclude=frozenset()):
     """Rank taxonomy entries against the document and keep the top `limit`.
 
@@ -518,7 +535,7 @@ def shortlist(candidates, text, limit, exclude=frozenset()):
     often it is used elsewhere in the archive.
     """
     norm_text = normalize(text)
-    doc_tokens = tokenize(text)
+    doc_tokens = {stem(word) for word in tokenize(text)}
     scored = []
     for cand in candidates:
         try:
@@ -532,7 +549,7 @@ def shortlist(candidates, text, limit, exclude=frozenset()):
         norm_name = normalize(name)
         if len(norm_name) > 2 and norm_name in norm_text:
             score += 4.0
-        name_tokens = tokenize(name)
+        name_tokens = {stem(word) for word in tokenize(name)}
         if name_tokens and doc_tokens:
             score += 2.0 * (len(name_tokens & doc_tokens) / len(name_tokens))
         try:
@@ -540,10 +557,13 @@ def shortlist(candidates, text, limit, exclude=frozenset()):
         except (TypeError, ValueError):
             count = 0.0
         score += 0.15 * min(3.0, (count + 1) ** 0.5 - 1.0)
-        scored.append((score, {"id": object_id, "name": name, "score": round(score, 3)}))
+        scored.append((score, count, {"id": object_id, "name": name, "score": round(score, 3)}))
 
-    scored.sort(key=lambda pair: (-pair[0], pair[1]["name"].casefold()))
-    return [item for _score, item in scored[:limit]]
+    # Ties break on how much a tag is actually used, then on its name. Without the usage
+    # term a document whose text matches no tag name degenerates into alphabetical order,
+    # which silently drops the correct tag from DECIDER_MAX_TAG_OPTIONS (measured live).
+    scored.sort(key=lambda pair: (-pair[0], -pair[1], pair[2]["name"].casefold()))
+    return [item for _score, _count, item in scored[:limit]]
 
 
 def document_stem(doc):

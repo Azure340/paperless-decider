@@ -415,6 +415,38 @@ def main():
         str(sorted(decider.WARNED_MISSING_SKIP)),
     )
 
+    # ---- shortlist recall: stems and tie-breaks ----
+    check(
+        "stem() folds plurals, -ing and -ment without eating short words",
+        [decider.stem(w) for w in ("taxes", "tax", "licenses", "licensing", "amendments",
+                                    "visa", "data", "the")] ==
+        ["tax", "tax", "licens", "licens", "amend", "visa", "data", "the"],
+        str([decider.stem(w) for w in ("taxes", "licenses", "amendments")]),
+    )
+    recall = [{"id": 201, "name": "US Taxes", "document_count": 115},
+              {"id": 202, "name": "Passports", "document_count": 120},
+              {"id": 203, "name": "Work", "document_count": 121},
+              {"id": 204, "name": "Pool", "document_count": 119}]
+    tax_text = "INTERNAL REVENUE SERVICE Amended return for tax year 2025. Tax paid."
+    picked = [c["name"] for c in decider.shortlist(recall, tax_text, 3)]
+    check(
+        "a tag whose singular form appears in the text reaches the shortlist",
+        "US Taxes" in picked,
+        str(picked),
+    )
+    check(
+        "unrelated high-usage tags do not outrank the one that matched",
+        picked[0] == "US Taxes",
+        str(picked),
+    )
+    tied = [{"id": 1, "name": "Alpha Tag", "document_count": 100},
+            {"id": 2, "name": "Zeta Tag", "document_count": 115}]
+    check(
+        "with no lexical signal the busier tag wins the tie, not the alphabetically first",
+        decider.shortlist(tied, "nothing here names any of these", 1)[0]["name"] == "Zeta Tag",
+        str(decider.shortlist(tied, "nothing here names any of these", 2)),
+    )
+
     # ---- an inference server that dies mid-request ----
     crash_server = serve(FakeCrashOllama)
     crash_cfg = dataclasses.replace(

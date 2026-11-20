@@ -36,7 +36,7 @@ Workflow 2  Document updated -> webhook -> paperless-decider       [optional re-
 | `build_workflow_action_context()` sets `"id": ""` during Consumption | trigger must be *Document added* / *Document updated*, never *Consumption* |
 | `apply_ai_suggestions` ends with `# No document_updated signal to avoid loop` | the AI title step never fires a *Document updated* workflow: the webhook has to be a **second action of the same workflow** |
 | webhook params are Jinja2 (`{{ doc_id }}`, `{{ doc_title }}`) | `{id}` is not a variable, arrives literally, and the sidecar answers 422 |
-| `/v1/systemone` allows 2–26 options per `choice` question | big taxonomies are shortlisted before asking |
+| `/v1/systemone` allows 2–26 options per `choice` question | big taxonomies are shortlisted first: whole name in the text, then stem-matched words (taxes~tax), then usage |
 | multiple questions in one request skew each other's probabilities | one question per request, `keep_alive` keeps the model warm |
 | `PAPERLESS_WEBHOOKS_ALLOWED_PORTS` is empty by default | no paperless env changes needed for a non-standard port |
 
@@ -111,10 +111,10 @@ curl -s localhost:8090/healthz
 ```
 
 Verified offline with no network and no model (Python 3.11+, standard library only) —
-43 checks in total, run in CI on every push and PR:
+46 checks in total, run in CI on every push and PR:
 ```bash
 python3 tests/test_title_wait.py     # 10 checks: the title -> tags handoff
-python3 tests/selftest.py            # 33 checks: fake paperless + fake Ollama end to end
+python3 tests/selftest.py            # 36 checks: fake paperless + fake Ollama end to end
 ```
 
 ## paperless setup (two workflows)
