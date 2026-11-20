@@ -110,10 +110,10 @@ curl -s localhost:8090/healthz
 ```
 
 Verified offline with no network and no model (Python 3.11+, standard library only) —
-33 checks in total, run in CI on every push and PR:
+38 checks in total, run in CI on every push and PR:
 ```bash
 python3 tests/test_title_wait.py     # 10 checks: the title -> tags handoff
-python3 tests/selftest.py            # 23 checks: fake paperless + fake Ollama end to end
+python3 tests/selftest.py            # 28 checks: fake paperless + fake Ollama end to end
 ```
 
 ## paperless setup (two workflows)
@@ -161,6 +161,11 @@ permissions" is enough). The workflow needs no write access to the repository it
   (that stays the LLM's job).
 - Two near-duplicate labels (`Rechnung` next to `Invoice`) cannot be separated by probability.
   Merge them.
+- Your `DECIDER_REVIEW_TAG` / `DECIDER_DONE_TAG` markers are never offered to the model - that
+  service bookkeeping is not a subject a document can be about. Without the exclusion the
+  model answers "Is this document about needs-review?" (measured live: p=0.79 on an
+  insurance policy), which wastes a candidate slot and can file a document for review on
+  wording alone.
 - `choice`/`noul` questions are English-shaped. For non-English archives, set the
   `DECIDER_Q_*` variables to questions in your language.
 - Confidence is calibration against the model's own distribution, not correctness. Tune the

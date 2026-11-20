@@ -359,6 +359,34 @@ def main():
         str(again.get("result")),
     )
 
+    # ---- the service's own tags must never be candidates ----
+    wide = dataclasses.replace(cfg, max_tag_options=25)
+    offered = [d.label for d in decider.decide_tags(wide, pl, ollama, DOCUMENT["content"], set())]
+    check(
+        "bookkeeping tags exist in the fake taxonomy (test is meaningful)",
+        "ai-review" in [t["name"] for t in TAGS],
+        str([t["name"] for t in TAGS]),
+    )
+    check(
+        "the service's own bookkeeping tags are never offered to the model",
+        "ai-review" not in offered,
+        str(offered),
+    )
+    check(
+        "real taxonomy tags are still offered (nothing over-blocked)",
+        set(["Insurance", "Car", "Health", "Urgent"]) == set(offered),
+        str(offered),
+    )
+    check(
+        "marker_tag_ids resolves both configured markers",
+        decider.marker_tag_ids(cfg, pl) == set([90]),
+        str(decider.marker_tag_ids(cfg, pl)),
+    )
+    check(
+        "no markers configured -> nothing blocked beyond current tags",
+        decider.marker_tag_ids(dataclasses.replace(cfg, review_tag="", done_tag=""), pl) == set(),
+    )
+
     # ---- an inference server that dies mid-request ----
     crash_server = serve(FakeCrashOllama)
     crash_cfg = dataclasses.replace(

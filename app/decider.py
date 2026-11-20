@@ -612,8 +612,31 @@ def decide_single_field(cfg, pl, ollama, field, state, question, existing_id):
     return decision
 
 
+def marker_tag_ids(cfg, pl):
+    """Ids of the bookkeeping tags this service writes for its own state machine.
+
+    `auto-tagged` / `needs-review` are metadata, not subjects a document can be
+    about. Left in the taxonomy the model is asked things like "Is this document
+    about needs-review?" - measured live: p=0.79 on an insurance policy, almost
+    enough to file a document as needing review because its wording sounded
+    review-ish - and each one also burns a candidate slot the real tags needed.
+    """
+    wanted = {normalize(cfg.review_tag), normalize(cfg.done_tag)} - {""}
+    if not wanted:
+        return set()
+    ids = set()
+    for tag in pl.taxonomy("tag"):
+        if normalize(str(tag.get("name", ""))) in wanted:
+            try:
+                ids.add(int(tag["id"]))
+            except (TypeError, ValueError, KeyError):
+                continue
+    return ids
+
+
 def decide_tags(cfg, pl, ollama, state, current_tag_ids):
-    candidates = shortlist(pl.taxonomy("tag"), state, cfg.max_tag_options, exclude=set(current_tag_ids))
+    blocked = set(current_tag_ids) | marker_tag_ids(cfg, pl)
+    candidates = shortlist(pl.taxonomy("tag"), state, cfg.max_tag_options, exclude=blocked)
     decisions = []
     for cand in candidates:
         label = cand["name"]
