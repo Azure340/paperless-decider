@@ -25,6 +25,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(HERE), "app"))
 PAPERLESS_PORT = 18099
 OLLAMA_PORT = 18100
 SIDECAR_PORT = 18101
+OLLAMA_CRASH_PORT = 18102
 SECRET = "s3cret"
 
 PATCHES = []
@@ -199,6 +200,28 @@ class FakeOllama(BaseHTTPRequestHandler):
         pass
 
 
+class FakeCrashOllama(BaseHTTPRequestHandler):
+    """An upstream that accepts the connection and hangs up with no reply.
+
+    Exactly what Ollama does when its llama-server child is SIGKILLed (the 4.6 GB
+    tev1 Q8_0 build on a memory-capped container): the client gets
+    RemoteDisconnected rather than an HTTP status, which used to escape
+    request_json uncaught and abort the decision with a bare traceback.
+    """
+
+    port = OLLAMA_CRASH_PORT
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length") or 0)
+        if length:
+            self.rfile.read(length)
+        self.close_connection = True
+        self.connection.close()
+
+    def log_message(self, *args):
+        pass
+
+
 def serve(handler):
     httpd = ThreadingHTTPServer(("127.0.0.1", handler.port), handler)
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
@@ -335,6 +358,51 @@ def main():
         again["result"] == "nothing to apply" and len(PATCHES) == before,
         str(again.get("result")),
     )
+
+    # ---- an inference server that dies mid-request ----
+    crash_server = serve(FakeCrashOllama)
+    crash_cfg = dataclasses.replace(
+        cfg,
+        ollama_url="http://127.0.0.1:" + str(OLLAMA_CRASH_PORT),
+        retries=1,
+        decision_timeout=10.0,
+    )
+    crash_ollama = decider.Ollama(crash_cfg)
+    raised = None
+    try:
+        crash_ollama.noul(
+            "TITLE: Rechnung\n\nAllianz Kfz Versicherung",
+            "Is this document about Insurance?",
+            "The document is about Insurance.",
+            "The document is not about Insurance.",
+        )
+    except Exception as exc:
+        raised = exc
+    check(
+        "a hung-up inference connection is retried and reported, not raw",
+        isinstance(raised, decider.DecisionError)
+        and "RemoteDisconnected" in str(raised)
+        and "2 attempts" in str(raised),
+        str(raised)[:220],
+    )
+
+    crash_worker = decider.Worker(crash_cfg, pl, crash_ollama)
+    threading.Thread(target=crash_worker.run, daemon=True).start()
+    crash_worker.submit(77)
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline and (
+        not decider.RESULTS or "error" not in decider.RESULTS[0]
+    ):
+        time.sleep(0.2)
+    first = decider.RESULTS[0] if decider.RESULTS else {}
+    check(
+        "/status stores why a decision failed, not just 'see log'",
+        crash_worker.failed == 1
+        and "RemoteDisconnected" in str(first.get("error", ""))
+        and first.get("document_id") == 77,
+        str(first)[:240],
+    )
+    crash_server.shutdown()
 
     # ---- HTTP surface ----
     worker = decider.Worker(cfg, pl, ollama)

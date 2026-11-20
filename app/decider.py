@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import collections
 import dataclasses
+import http.client
 import json
 import logging
 import os
@@ -155,7 +156,7 @@ class Config:
             paperless_token=_s("PAPERLESS_API_TOKEN"),
             api_timeout=_f("DECIDER_API_TIMEOUT", 30.0),
             ollama_url=_s("OLLAMA_URL", "http://ollama:11434").rstrip("/"),
-            model=_s("DECIDER_MODEL", "tev1"),
+            model=_s("DECIDER_MODEL", "tev1:0.8b"),
             decision_timeout=_f("DECIDER_TIMEOUT", 60.0),
             retries=_i("DECIDER_RETRIES", 2),
             keep_alive=_s("DECIDER_KEEP_ALIVE", "10m"),
@@ -241,6 +242,13 @@ def request_json(method, url, body=None, headers=None, timeout=30.0):
         raise HTTPProblem(exc.code, url, _read_error_body(exc)) from exc
     except urllib.error.URLError as exc:
         raise HTTPProblem(0, url, str(getattr(exc, "reason", exc))) from exc
+    except (OSError, http.client.HTTPException) as exc:
+        # An upstream that dies mid-request (Ollama SIGKILLs llama-server when a
+        # decision model outgrows its container, which is how tev1:latest fails on
+        # a small host) hangs up without a status line. urllib only wraps connect
+        # failures, so without this the raw RemoteDisconnected escaped, skipped the
+        # retries and aborted the whole decision with a traceback.
+        raise HTTPProblem(0, url, type(exc).__name__ + ": " + str(exc)) from exc
     if not raw:
         return None
     try:
@@ -789,10 +797,18 @@ class Worker:
             doc_id = self.queue.get()
             try:
                 RESULTS.appendleft(process_document(doc_id, self.cfg, self.pl, self.ollama))
-            except Exception:
+            except Exception as exc:
                 self.failed += 1
                 LOG.exception("decision failed for document %s", doc_id)
-                RESULTS.appendleft({"document_id": doc_id, "error": "see log"})
+                # /status is the only place an operator can see WHY a document was
+                # never tagged, so keep one readable line. These messages carry URLs
+                # and response bodies, never the request headers, so no token leaks.
+                RESULTS.appendleft(
+                    {
+                        "document_id": doc_id,
+                        "error": type(exc).__name__ + ": " + " ".join(str(exc).split())[:300],
+                    },
+                )
                 # Let a later webhook delivery (or a manual retry) try again.
                 self.forget(doc_id)
             finally:
