@@ -293,6 +293,7 @@ def main():
             "DECIDER_MAX_SINGLE_OPTIONS": "10",
             "DECIDER_MIN_CONTENT_CHARS": "80",
             "DECIDER_SKIP_TAGS": "",
+            "DECIDER_QUESTIONS_PER_REQUEST": "",
             "DECIDER_HOST": "127.0.0.1",
             "DECIDER_PORT": str(SIDECAR_PORT),
             "DECIDER_LOG_LEVEL": "CRITICAL",
@@ -522,6 +523,40 @@ def main():
         str(decider.shortlist(tied, "nothing here names any of these", 2)),
     )
 
+    # ---- one request per document, by default ----
+    # grey_zone=0 here so these checks count requests, not re-asks
+    default_cfg = dataclasses.replace(cfg, max_tag_options=0, questions_per_request=0,
+                                      grey_zone=0.0)
+    marker = len(BATCH_SIZES)
+    one = decider.decide_tags(default_cfg, pl, ollama, DOCUMENT["content"], set())
+    sent = BATCH_SIZES[marker:]
+    check(
+        "questions_per_request=0 sends the whole taxonomy in one request",
+        sent == [5],
+        str(sent),
+    )
+    chunked_cfg = dataclasses.replace(default_cfg, questions_per_request=2)
+    marker = len(BATCH_SIZES)
+    chunked = decider.decide_tags(chunked_cfg, pl, ollama, DOCUMENT["content"], set())
+    sent = BATCH_SIZES[marker:]
+    check(
+        "a positive DECIDER_QUESTIONS_PER_REQUEST still chunks the same labels",
+        sent == [2, 2, 1],
+        str(sent),
+    )
+    check(
+        "chunking changes the requests, never the coverage or the order",
+        [d.label for d in one] == [d.label for d in chunked],
+        str([d.label for d in one]) + " vs " + str([d.label for d in chunked]),
+    )
+    check(
+        "question_batches always returns a usable plan",
+        decider.question_batches(default_cfg, []) == [[]]
+        and decider.question_batches(dataclasses.replace(default_cfg, questions_per_request=1),
+                                     ["a", "b"]) == [["a"], ["b"]]
+        and decider.question_batches(default_cfg, ["a", "b"]) == [["a", "b"]],
+    )
+
     # ---- an inference server that dies mid-request ----
     crash_server = serve(FakeCrashOllama)
     crash_cfg = dataclasses.replace(
@@ -625,6 +660,11 @@ def main():
         "GET /status reports the skip list so it can be verified live",
         status.get("skip_tags") == [],
         str(status.get("skip_tags")),
+    )
+    check(
+        "GET /status says how the questions are being sent",
+        status.get("questions_per_request") == "all in one request",
+        str(status.get("questions_per_request")),
     )
 
     # ---- a write must only ever ADD ----

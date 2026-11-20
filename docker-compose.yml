@@ -31,7 +31,9 @@ services:
       # per chunk instead of once per tag. Anything within DECIDER_GREY_ZONE of the tag
       # threshold is re-asked alone, because batching shifts numbers slightly.
       DECIDER_MAX_TAG_OPTIONS: ${DECIDER_MAX_TAG_OPTIONS:-0}
-      DECIDER_QUESTIONS_PER_REQUEST: ${DECIDER_QUESTIONS_PER_REQUEST:-10}
+      # 0 = the whole taxonomy in one /v1/systemone request. A positive value chunks
+      # it: smaller requests bound what a timeout or a killed llama-server can cost.
+      DECIDER_QUESTIONS_PER_REQUEST: ${DECIDER_QUESTIONS_PER_REQUEST:-0}
       DECIDER_GREY_ZONE: ${DECIDER_GREY_ZONE:-0.03}
       # ---- write behaviour ---------------------------------------------
       DECIDER_DRY_RUN: ${DECIDER_DRY_RUN:-true}

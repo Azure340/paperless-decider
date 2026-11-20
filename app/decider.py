@@ -177,7 +177,9 @@ class Config:
             # 0 (the default) = ask about EVERY tag. Ranking stays as the order to ask
             # in and as the knob that re-introduces a shortlist if you set it > 0.
             max_tag_options=max(0, min(25, _i("DECIDER_MAX_TAG_OPTIONS", 0))),
-            questions_per_request=max(1, min(25, _i("DECIDER_QUESTIONS_PER_REQUEST", 10))),
+            # 0 (the default) = the whole taxonomy in ONE request. A positive value
+            # chunks it, which bounds what a timeout or a killed llama-server can cost.
+            questions_per_request=max(0, _i("DECIDER_QUESTIONS_PER_REQUEST", 0)),
             grey_zone=_f("DECIDER_GREY_ZONE", 0.03),
             overwrite=_b("DECIDER_OVERWRITE", False),
             review_tag=_s("DECIDER_REVIEW_TAG"),
@@ -774,6 +776,23 @@ def skip_tag_ids(cfg, pl):
     return ids
 
 
+def question_batches(cfg, labels):
+    """Split `labels` into the /v1/systemone requests to send.
+
+    DECIDER_QUESTIONS_PER_REQUEST=0 (the default) is one request for everything: the
+    document is prefilled once either way, so chunking only added round trips. Measured
+    with 50 tags on tev1:0.8b + Intel Arc - one request 9.4 s / 19.9 s, five chunks of 10
+    10.0 s / 22.3 s, fifty solo requests 32.2 s / 132.2 s - and the drift against solo
+    baselines was the same at every chunk size (mean 0.002, worst 0.02, no tag crossing
+    the threshold differently). Keep a positive value if the taxonomy grows past ~100
+    tags or DECIDER_TIMEOUT is tight: a smaller request loses less when it fails.
+    """
+    size = cfg.questions_per_request
+    if size <= 0 or size >= len(labels):
+        return [list(labels)]
+    return [list(labels[start:start + size]) for start in range(0, len(labels), size)]
+
+
 def ask_tag_probabilities(cfg, ollama, state, labels):
     """Probability per label, in as few requests as possible.
 
@@ -791,9 +810,8 @@ def ask_tag_probabilities(cfg, ollama, state, labels):
         ).probability
 
     probs = {}
-    if cfg.questions_per_request > 1:
-        for start in range(0, len(labels), cfg.questions_per_request):
-            chunk = labels[start:start + cfg.questions_per_request]
+    if labels:
+        for chunk in question_batches(cfg, labels):
             probs.update(ollama.noul_many(state, chunk))
     reasked = set()
     for label in labels:
@@ -1192,7 +1210,8 @@ class Handler(BaseHTTPRequestHandler):
                     "model": self.cfg.model,
                     "thresholds": {"single": self.cfg.thresh_single, "tag": self.cfg.thresh_tag},
                     "options": {"single": self.cfg.max_single_options, "tag": self.cfg.max_tag_options},
-                    "questions_per_request": self.cfg.questions_per_request,
+                    "questions_per_request": (self.cfg.questions_per_request
+                                              or "all in one request"),
                     "grey_zone": self.cfg.grey_zone,
                     "skip_tags": list(self.cfg.skip_tags),
                     "last_results": list(RESULTS)[:15],
@@ -1269,7 +1288,7 @@ def main():
     signal.signal(signal.SIGINT, shutdown)
     LOG.info(
         "listening on %s:%s | fields=%s thresh(single=%.2f tag=%.2f) overwrite=%s "
-        "dry_run=%s wait_for_title=%s model=%s auth=%s tags_asked=%s questions_per_request=%d grey_zone=%.3f",
+        "dry_run=%s wait_for_title=%s model=%s auth=%s tags_asked=%s questions_per_request=%s grey_zone=%.3f",
         cfg.host,
         cfg.port,
         ",".join(cfg.fields),
@@ -1281,7 +1300,7 @@ def main():
         cfg.model,
         "token" if cfg.secret else "OPEN",
         "all" if not cfg.max_tag_options else cfg.max_tag_options,
-        cfg.questions_per_request,
+        cfg.questions_per_request or "one request",
         cfg.grey_zone,
     )
     try:

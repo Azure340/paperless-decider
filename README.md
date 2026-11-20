@@ -37,7 +37,7 @@ Workflow 2  Document updated -> webhook -> paperless-decider       [optional re-
 | `apply_ai_suggestions` ends with `# No document_updated signal to avoid loop` | the AI title step never fires a *Document updated* workflow: the webhook has to be a **second action of the same workflow** |
 | webhook params are Jinja2 (`{{ doc_id }}`, `{{ doc_title }}`) | `{id}` is not a variable, arrives literally, and the sidecar answers 422 |
 | `/v1/systemone` allows 2–26 options per `choice` question | big taxonomies are shortlisted first: whole name in the text, then stem-matched words (taxes~tax), then usage |
-| batching questions shifts probabilities (measured: mean 0.002, worst 0.014) | questions are batched for speed, and anything within `DECIDER_GREY_ZONE` of the threshold is re-asked alone; `keep_alive` keeps the model warm |
+| batching questions shifts probabilities (measured: mean 0.002, worst 0.022 - the same at every chunk size) | the whole taxonomy goes out in one request, and anything within `DECIDER_GREY_ZONE` of the threshold is re-asked alone; `keep_alive` keeps the model warm |
 | `choice` dilutes its winner across the field | tags are independent yes/no questions (`noul`), never a 26-option contest: `US Taxes` read 0.9876 solo but only 0.7448 as the winner of a 27-option choice |
 | `PAPERLESS_WEBHOOKS_ALLOWED_PORTS` is empty by default | no paperless env changes needed for a non-standard port |
 
@@ -75,7 +75,7 @@ Everything is environment variables. **Never commit `.env`** (it is git-ignored)
 | `DECIDER_THRESH_TAG` | `0.80` | probability needed to add a tag |
 | `DECIDER_THRESH_SINGLE` | `0.85` | probability needed to set correspondent / type / path |
 | `DECIDER_MAX_TAG_OPTIONS` | `0` (= all) | how many tags get asked about; `0` asks about every visible tag |
-| `DECIDER_QUESTIONS_PER_REQUEST` | `10` | yes/no questions packed into one `/v1/systemone` request |
+| `DECIDER_QUESTIONS_PER_REQUEST` | `0` (= one request) | questions per `/v1/systemone` call; `0` sends the whole taxonomy at once |
 | `DECIDER_GREY_ZONE` | `0.03` | re-ask a tag alone when its batched probability is this close to the threshold |
 | `DECIDER_MAX_SINGLE_OPTIONS` | `20` | cap for `choice` options (hard API limit 26) |
 | `DECIDER_WAIT_FOR_TITLE` | `false` | wait for paperless' AI title before deciding (the handoff) |
@@ -114,10 +114,10 @@ curl -s localhost:8090/healthz
 ```
 
 Verified offline with no network and no model (Python 3.11+, standard library only) —
-61 checks in total, run in CI on every push and PR:
+66 checks in total, run in CI on every push and PR:
 ```bash
 python3 tests/test_title_wait.py     # 10 checks: the title -> tags handoff
-python3 tests/selftest.py            # 51 checks: fake paperless + fake Ollama end to end
+python3 tests/selftest.py            # 56 checks: fake paperless + fake Ollama end to end
 ```
 
 ## paperless setup (two workflows)
@@ -182,10 +182,14 @@ permissions" is enough). The workflow needs no write access to the repository it
   `DECIDER_Q_*` variables to questions in your language.
 - Confidence is calibration against the model's own distribution, not correctness. Tune the
   thresholds against `GET /preview/<id>` on documents you already know the answer to.
-- Asking about every tag costs one forward pass per tag, batched so the document is prefilled
-  once per chunk. A ~50 tag taxonomy lands around 10-20 s per document on an iGPU - paperless
-  never waits for it (the webhook is answered in milliseconds), but `DECIDER_WORKERS` is the
-  knob when ingesting in bulk.
+- Asking about every tag costs one forward pass per tag. One request for the whole taxonomy is
+  the default because the document is prefilled once per request either way: measured with 50
+  tags on `tev1:0.8b` + Intel Arc, one request took 9.4 s (a 690-character letter) and 19.9 s
+  (a 38 KB policy) versus 10.0 s / 22.3 s in five chunks of 10, and 32.2 s / 132.2 s asked one
+  at a time. Chunk with a positive `DECIDER_QUESTIONS_PER_REQUEST` if the taxonomy grows past
+  ~100 tags or `DECIDER_TIMEOUT` is tight - a smaller request loses less when it fails, and a
+  failed batch falls back to asking those tags one at a time. paperless never waits for any of
+  it (the webhook is answered in milliseconds); `DECIDER_WORKERS` is the bulk-ingest knob.
 - Tags are multi-label by design. A single `choice` question over the whole taxonomy would be
   one forward pass and one winner, and would silently drop every second tag a document earns.
 
