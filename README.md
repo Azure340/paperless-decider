@@ -36,6 +36,7 @@ Workflow 2  Document updated -> webhook -> paperless-decider       [optional re-
 | `build_workflow_action_context()` sets `"id": ""` during Consumption | trigger must be *Document added* / *Document updated*, never *Consumption* |
 | `apply_ai_suggestions` ends with `# No document_updated signal to avoid loop` | the AI title step never fires a *Document updated* workflow: the webhook has to be a **second action of the same workflow** |
 | webhook params are Jinja2 (`{{ doc_id }}`, `{{ doc_title }}`) | `{id}` is not a variable, arrives literally, and the sidecar answers 422 |
+| `send_webhook.apply_async()` runs **inside** the consumer's `transaction.atomic()` block (only `apply_ai_suggestions` uses `delay_on_commit`) | the webhook can be delivered before the new row is visible: the first `GET /api/documents/<id>/` answers 404. `read_document` retries inside the wait budget instead of believing the document is gone - measured live, the commit landed 231 ms after that read |
 | `/v1/systemone` allows 2–26 options per `choice` question | big taxonomies are shortlisted first: whole name in the text, then stem-matched words (taxes~tax), then usage |
 | batching questions shifts probabilities (measured: mean 0.002, worst 0.022 - the same at every chunk size) | the whole taxonomy goes out in one request, and anything within `DECIDER_GREY_ZONE` of the threshold is re-asked alone; `keep_alive` keeps the model warm |
 | `choice` dilutes its winner across the field | tags are independent yes/no questions (`noul`), never a 26-option contest: `US Taxes` read 0.9876 solo but only 0.7448 as the winner of a 27-option choice |
@@ -114,9 +115,9 @@ curl -s localhost:8090/healthz
 ```
 
 Verified offline with no network and no model (Python 3.11+, standard library only) —
-68 checks in total, run in CI on every push and PR:
+74 checks in total, run in CI on every push and PR:
 ```bash
-python3 tests/test_title_wait.py     # 10 checks: the title -> tags handoff
+python3 tests/test_title_wait.py     # 16 checks: the title -> tags handoff + the commit race
 python3 tests/selftest.py            # 58 checks: fake paperless + fake Ollama end to end
 ```
 
@@ -145,6 +146,27 @@ keys. The sidecar now reads both shapes, re-reads the document immediately befor
 (the read can be minutes old, because it waited for the AI title), merges, and refuses to
 write at all if it cannot read the current tags. A tag paperless added in the meantime -
 typically an inbox tag - is kept, and `tags_added_by_others` in `/status` says which.
+
+### Reading the log
+
+Every document that arrives leaves at least one line now, because "no tags were
+written" used to be indistinguishable from "nothing happened":
+
+```
+document 1335: webhook received, decision queued (queue=0)      <- proof it arrived
+document 1335: patched tags=[3, 24] (21734ms)                   <- the write, add-only
+document 1335: dry run, would patch tags=[3]                    <- DECIDER_DRY_RUN=true
+document 1335: no tag and no field above threshold, nothing written (18990ms)
+document 1335: left correspondent alone, a human had already set them
+WARNING document 1335: skipped (content under 80 chars (blank scan?))
+WARNING document 1335: skipped (paperless answered 404 for the whole wait budget - ...)
+```
+
+A skip is a WARNING on purpose: it is not a normal outcome, and `/status`
+`last_results` was the only other place it appeared. The 404 wording covers both
+causes - a document deleted mid-flight, and an API token whose user cannot see the
+document - so if *every* upload skips that way while the archive is otherwise
+reachable, check which user owns `PAPERLESS_API_TOKEN` before anything else.
 
 ## CI / image
 

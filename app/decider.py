@@ -847,12 +847,72 @@ def decide_tags(cfg, pl, ollama, state, current_tag_ids):
     return decisions
 
 
-def reload_for_title(doc_id, cfg, pl, report):
-    """Optionally wait for paperless' AI title before deciding.
+def _brief(payload):
+    """`tags=[1, 2], correspondent=3` - how a write looks in the log."""
+    return ", ".join(str(key) + "=" + str(value) for key, value in payload.items())
 
-    Returns the refreshed document, or None if it disappeared meanwhile.
+
+def _skip(report, reason):
+    """Log why a document is being left alone, then report it.
+
+    Every early exit used to be visible only in `/status`'s `last_results`, which
+    is how a lost commit race looked exactly like a working pipeline: no log line,
+    no tags, no trace. A skip is not a normal outcome, so it is a WARNING.
     """
-    doc = pl.document(doc_id)
+    report["skipped"] = reason
+    LOG.warning("document %s: skipped (%s)", report["document_id"], reason)
+    return report
+
+
+def read_document(doc_id, cfg, pl, report):
+    """GET one document, waiting out paperless' commit race.
+
+    Returns the document, or None when it stayed unreadable; `report["gone"]` then
+    says which kind of gone.
+
+    A 404 on a document the webhook just announced usually does NOT mean it is
+    gone. paperless queues the webhook task with `send_webhook.apply_async()` from
+    *inside* the consumer's `transaction.atomic()` block - only
+    `apply_ai_suggestions` uses `delay_on_commit` - so the request can be delivered,
+    and this read can run, before the INSERT is visible to another connection.
+    Measured live on 2026-11-20: document 1335 was inserted at 23:46:20.614, the
+    webhook landed 221 ms later, this read followed 24 ms after that, and the
+    commit only arrived at 23:46:21.09. The first version of this code read once,
+    believed the 404 and skipped the document in silence.
+
+    Waiting is safe in both directions: a document that really was deleted just
+    costs the wait budget instead of one webhook delivery.
+    """
+    # DECIDER_WAIT_FOR_TITLE=false means "answer me now" (/preview, /decide/sync),
+    # so it gets a single read: a wrong id must not stall a waiting caller.
+    tries = cfg.title_poll_tries if cfg.wait_for_title else 0
+    slept = 0.0
+    for attempt in range(tries + 1):
+        try:
+            return pl.document(doc_id)
+        except HTTPProblem as exc:
+            if exc.status != 404:
+                raise
+            if attempt == tries:
+                report["gone"] = "never readable"
+                return None
+            time.sleep(cfg.title_poll_seconds)
+            slept += cfg.title_poll_seconds
+            report["uncommitted_retries"] = attempt + 1
+            report["commit_wait_seconds"] = round(slept, 2)
+    report["gone"] = "never readable"
+    return None
+
+
+def reload_for_title(doc_id, cfg, pl, report):
+    """Read the document, then optionally wait for paperless' AI title.
+
+    Returns the refreshed document, or None if it disappeared - or never became
+    visible - meanwhile.
+    """
+    doc = read_document(doc_id, cfg, pl, report)
+    if doc is None:
+        return None
     if not cfg.wait_for_title:
         return doc
     waited = 0.0
@@ -865,6 +925,8 @@ def reload_for_title(doc_id, cfg, pl, report):
             doc = pl.document(doc_id)
         except HTTPProblem as exc:
             if exc.status == 404:
+                # It was readable a moment ago, so this really is a deletion.
+                report["gone"] = "deleted while waiting for its title"
                 return None
             raise
     else:
@@ -879,30 +941,26 @@ def process_document(doc_id, cfg, pl, ollama):
     """Decide one document and (unless dry run) write back what changed."""
     started = time.monotonic()
     report = {"document_id": doc_id, "dry_run": cfg.dry_run, "decisions": {}}
-    try:
-        doc = reload_for_title(doc_id, cfg, pl, report)
-    except HTTPProblem as exc:
-        if exc.status == 404:
-            report["skipped"] = "document no longer exists"
-            return report
-        raise
+    doc = reload_for_title(doc_id, cfg, pl, report)
     if doc is None:
-        report["skipped"] = "document deleted while waiting for its title"
-        return report
+        if report.get("gone") == "never readable":
+            reason = ("paperless answered 404 for the whole wait budget - the document "
+                      "is gone, or the API token cannot see it")
+            return _skip(report, reason)
+        return _skip(report, "document deleted while waiting for its title")
 
     content = str(doc.get("content") or "").strip()
     report["title"] = doc.get("title")
     if len(content) < cfg.min_content_chars:
-        report["skipped"] = "content under " + str(cfg.min_content_chars) + " chars (blank scan?)"
-        return report
+        return _skip(report, "content under " + str(cfg.min_content_chars)
+                     + " chars (blank scan?)")
 
     state = build_state(doc, cfg.max_state_chars)
     existing_set = tag_ids(doc)
     if existing_set is None:
         # Without this the write below would replace the whole list with only what
         # the model picked, i.e. delete the document's existing tags.
-        report["skipped"] = "document had no readable tags field - refusing to write"
-        return report
+        return _skip(report, "document had no readable tags field - refusing to write")
     existing_tags = sorted(existing_set)
 
     payload = {}
@@ -959,9 +1017,12 @@ def process_document(doc_id, cfg, pl, ollama):
 
     if not payload:
         report["result"] = "nothing to apply"
+        LOG.info("document %s: no tag and no field above threshold, nothing written (%dms)",
+                 doc_id, report["duration_ms"])
         return report
     if cfg.dry_run:
         report["result"] = "dry run"
+        LOG.info("document %s: dry run, would patch %s", doc_id, _brief(payload))
         return report
 
     # The read above can be minutes old (we waited for the AI title first), and a tags
@@ -972,15 +1033,13 @@ def process_document(doc_id, cfg, pl, ollama):
         fresh = pl.document(doc_id)
     except HTTPProblem as exc:
         if exc.status == 404:
-            report["skipped"] = "document disappeared before the write"
             report["result"] = "nothing to apply"
-            return report
+            return _skip(report, "document disappeared between the decision and the write")
         raise
     now_tags = tag_ids(fresh)
     if now_tags is None:
-        report["skipped"] = "re-read had no readable tags field - refusing to write"
         report["result"] = "nothing to apply"
-        return report
+        return _skip(report, "re-read had no readable tags field - refusing to write")
     if "tags" in payload:
         merged = sorted(now_tags | set(payload["tags"]))
         report["tags_added_by_others"] = sorted(now_tags - set(payload["tags"]))
@@ -992,8 +1051,13 @@ def process_document(doc_id, cfg, pl, ollama):
         if field in payload and fresh.get(field) not in (None, ""):
             payload.pop(field)
             report.setdefault("skipped_stale_fields", []).append(field)
+    if report.get("skipped_stale_fields"):
+        LOG.info("document %s: left %s alone, a human had already set them",
+                 doc_id, ",".join(report["skipped_stale_fields"]))
     if not payload:
         report["result"] = "nothing to apply after re-read"
+        LOG.info("document %s: nothing left to write after the re-read (%dms)",
+                 doc_id, report["duration_ms"])
         return report
 
     pl.patch_document(doc_id, payload)
@@ -1002,7 +1066,7 @@ def process_document(doc_id, cfg, pl, ollama):
     LOG.info(
         "document %s: patched %s (%dms)",
         doc_id,
-        ", ".join(str(key) + "=" + str(value) for key, value in payload.items()),
+        _brief(payload),
         report["duration_ms"],
     )
     return report
@@ -1176,6 +1240,11 @@ class Handler(BaseHTTPRequestHandler):
 
         # paperless' webhook client gives up after 5.0 s: never decide inline.
         status_text = self.worker.submit(doc_id)
+        # Proof of receipt. Without this line you cannot tell "the webhook never
+        # arrived" from "the sidecar decided to do nothing" - which cost a whole
+        # debugging session on 2026-11-20.
+        LOG.info("document %s: webhook received, decision %s (queue=%d)",
+                 doc_id, status_text, self.worker.queue.qsize())
         self._send(
             202 if status_text != "full" else 503,
             {"document_id": doc_id, "status": status_text, "queue": self.worker.queue.qsize()},

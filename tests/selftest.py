@@ -358,8 +358,9 @@ def main():
 
     missing = decider.process_document(999, cfg, pl, ollama)
     check(
-        "404 document handled gracefully",
-        missing.get("skipped") == "document no longer exists",
+        "404 document handled gracefully (and reported as unreadable)",
+        missing.get("gone") == "never readable"
+        and "404 for the whole wait budget" in str(missing.get("skipped")),
         str(missing),
     )
 
