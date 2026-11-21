@@ -38,9 +38,14 @@ services:
       # ---- write behaviour ---------------------------------------------
       DECIDER_DRY_RUN: ${DECIDER_DRY_RUN:-true}
       DECIDER_OVERWRITE: ${DECIDER_OVERWRITE:-false}
-      DECIDER_REVIEW_TAG: ${DECIDER_REVIEW_TAG:-needs-review}
-      DECIDER_DONE_TAG: ${DECIDER_DONE_TAG:-auto-tagged}
-      DECIDER_REVIEW_ON_NO_TAGS: ${DECIDER_REVIEW_ON_NO_TAGS:-true}
+      # Marker tags are off by default, and this must stay in sync with the code
+      # defaults in README's table. The service creates a missing marker tag on
+      # demand (Paperless.tag_id(create=True)), so a non-empty default here would
+      # RESURRECT `needs-review`/`auto-tagged` right after you delete them. This
+      # archive's review queue is paperless' own inbox tag; markers are opt-in.
+      DECIDER_REVIEW_TAG: ${DECIDER_REVIEW_TAG:-}
+      DECIDER_DONE_TAG: ${DECIDER_DONE_TAG:-}
+      DECIDER_REVIEW_ON_NO_TAGS: ${DECIDER_REVIEW_ON_NO_TAGS:-false}
       # Tags that are workflow state rather than subject matter (e.g. an inbox tag).
       DECIDER_SKIP_TAGS: ${DECIDER_SKIP_TAGS:-}
       # ---- inference plumbing / limits ---------------------------------

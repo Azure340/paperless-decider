@@ -24,7 +24,8 @@ Workflow 2  Document updated -> webhook -> paperless-decider       [optional re-
                  reads the document + /api/tags/ (shortlist <= 26 options)
                  asks Ollama /v1/systemone one yes/no question per tag
                  PATCHes back only tags above the confidence threshold
-                 adds `auto-tagged`, or `needs-review` when nothing fitted
+                 (a `needs-review`/`auto-tagged` stamp only appears if you set
+                  DECIDER_REVIEW_TAG / DECIDER_DONE_TAG - both empty by default)
 ```
 
 ## Why this design (verified against paperless-ngx v3.5.1 source)
@@ -123,7 +124,11 @@ python3 tests/selftest.py            # 58 checks: fake paperless + fake Ollama e
 
 ## paperless setup (two workflows)
 
-1. Create tags `auto-tagged` and `needs-review` (matching rule **None**, not inbox tags).
+1. Marker tags are **opt-in and empty by default** (`DECIDER_REVIEW_TAG`, `DECIDER_DONE_TAG`).
+   If you do want the stamps, create `auto-tagged` and `needs-review` first (matching rule
+   **None**, so they are not inbox tags) and set both names. Creating them alone is not
+   enough to keep them away either: the service *creates* a missing marker tag, so a
+   non-empty default in `docker-compose.yml` would resurrect a tag you deleted.
 2. **Workflow 1** (the ingest path) — trigger *Document added*, two actions in this
    order: *Apply AI suggestions* (field **Title**), then *Send webhook*:
    - URL `http://paperless-decider:8090/decide`
