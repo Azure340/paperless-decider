@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import collections
 import dataclasses
+import hmac
 import http.client
 import json
 import logging
@@ -39,9 +40,11 @@ import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+VERSION = "2026.11.22"
 LOG = logging.getLogger("decider")
 MAX_BODY_BYTES = 1000000
 RESULTS = collections.deque(maxlen=100)
+RESULTS_LOCK = threading.Lock()
 
 SINGLE_FIELDS = ("correspondent", "document_type", "storage_path")
 TAXONOMY_ENDPOINTS = {
@@ -57,6 +60,7 @@ MIN_TOKEN_LENGTH = 3
 # wrong here means the PATCH silently deletes the tags of a real document.
 TAG_LIST_FIELDS = ("tags",)
 WARNED_MISSING_SKIP = set()
+WARNED_LOCK = threading.Lock()
 
 
 class ConfigError(RuntimeError):
@@ -216,6 +220,18 @@ class Config:
             raise ConfigError("PAPERLESS_API_TOKEN is required")
         if not self.paperless_url.startswith(("http://", "https://")):
             raise ConfigError("PAPERLESS_URL must be an http(s) URL")
+        if not self.ollama_url.startswith(("http://", "https://")):
+            raise ConfigError("OLLAMA_URL must be an http(s) URL")
+        if not 1 <= self.port <= 65535:
+            raise ConfigError("DECIDER_PORT must be in 1..65535")
+        if self.api_timeout <= 0:
+            raise ConfigError("DECIDER_API_TIMEOUT must be positive")
+        if self.decision_timeout <= 0:
+            raise ConfigError("DECIDER_TIMEOUT must be positive")
+        if self.retries < 0:
+            raise ConfigError("DECIDER_RETRIES must be non-negative")
+        if self.queue_max < 1:
+            raise ConfigError("DECIDER_QUEUE_MAX must be at least 1")
         if not self.fields:
             raise ConfigError("DECIDER_FIELDS selected no supported field")
         if not self.secret and not self.allow_no_auth:
@@ -244,34 +260,80 @@ class Config:
 # --------------------------------------------------------------------------
 # HTTP plumbing (stdlib)
 # --------------------------------------------------------------------------
+_CONN_LOCAL = threading.local()
+
+
+def _get_conn(scheme, host, port, timeout):
+    pool = getattr(_CONN_LOCAL, "pool", None)
+    if pool is None:
+        pool = {}
+        _CONN_LOCAL.pool = pool
+    key = (scheme, host, port)
+    conn = pool.get(key)
+    if conn is not None:
+        conn.timeout = timeout
+        return conn, True
+    if scheme == "https":
+        conn = http.client.HTTPSConnection(host, port, timeout=timeout)
+    else:
+        conn = http.client.HTTPConnection(host, port, timeout=timeout)
+    pool[key] = conn
+    return conn, False
+
+
+def _drop_conn(scheme, host, port):
+    pool = getattr(_CONN_LOCAL, "pool", None)
+    if pool is not None:
+        conn = pool.pop((scheme, host, port), None)
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
 def request_json(method, url, body=None, headers=None, timeout=30.0):
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        raise HTTPProblem(0, url, "unsupported URL scheme")
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    path = parsed.path or "/"
+    if parsed.query:
+        path = path + "?" + parsed.query
+
     data = None
-    hdrs = {"Accept": "application/json"}
+    hdrs = {"Accept": "application/json", "Connection": "keep-alive"}
     hdrs.update(headers or {})
     if body is not None:
         data = json.dumps(body).encode()
         hdrs["Content-Type"] = "application/json"
-    req = urllib.request.Request(url, data=data, headers=hdrs, method=method)
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+
+    for attempt in range(2):
+        conn, reused = _get_conn(parsed.scheme, parsed.hostname, port, timeout)
+        try:
+            conn.request(method, path, body=data, headers=hdrs)
+            resp = conn.getresponse()
             raw = resp.read()
-    except urllib.error.HTTPError as exc:
-        raise HTTPProblem(exc.code, url, _read_error_body(exc)) from exc
-    except urllib.error.URLError as exc:
-        raise HTTPProblem(0, url, str(getattr(exc, "reason", exc))) from exc
-    except (OSError, http.client.HTTPException) as exc:
-        # An upstream that dies mid-request (Ollama SIGKILLs llama-server when a
-        # decision model outgrows its container, which is how tev1:latest fails on
-        # a small host) hangs up without a status line. urllib only wraps connect
-        # failures, so without this the raw RemoteDisconnected escaped, skipped the
-        # retries and aborted the whole decision with a traceback.
-        raise HTTPProblem(0, url, type(exc).__name__ + ": " + str(exc)) from exc
-    if not raw:
-        return None
-    try:
-        return json.loads(raw.decode("utf-8", "replace"))
-    except json.JSONDecodeError as exc:
-        raise HTTPProblem(0, url, "non-JSON response: " + str(exc)) from exc
+            status = resp.status
+            if resp.getheader("Connection", "").lower() == "close":
+                _drop_conn(parsed.scheme, parsed.hostname, port)
+            if status >= 400:
+                detail = raw.decode("utf-8", "replace")
+                raise HTTPProblem(status, url, detail)
+            if not raw:
+                return None
+            try:
+                return json.loads(raw.decode("utf-8", "replace"))
+            except json.JSONDecodeError as exc:
+                raise HTTPProblem(0, url, "non-JSON response: " + str(exc)) from exc
+        except (OSError, http.client.HTTPException) as exc:
+            _drop_conn(parsed.scheme, parsed.hostname, port)
+            if reused and attempt == 0:
+                continue
+            # An upstream that dies mid-request (Ollama SIGKILLs llama-server when a
+            # decision model outgrows its container, which is how tev1:latest fails on
+            # a small host) hangs up without a status line.
+            raise HTTPProblem(0, url, type(exc).__name__ + ": " + str(exc)) from exc
 
 
 def _read_error_body(exc):
@@ -291,6 +353,7 @@ class Paperless:
         self.headers = {"Authorization": "Token " + cfg.paperless_token}
         self._tax_cache = {}
         self._lock = threading.Lock()
+        self._tag_create_lock = threading.Lock()
 
     def document(self, doc_id):
         url = self.base + "/api/documents/" + str(doc_id) + "/"
@@ -336,33 +399,48 @@ class Paperless:
         )
         return result if isinstance(result, dict) else {}
 
-    def tag_id(self, name, create=True):
-        """Find a tag by exact (accent/case-insensitive) name, optionally create it."""
-        wanted = normalize(name)
+    def _find_tag_id(self, wanted):
         for tag in self.taxonomy("tag"):
             if normalize(str(tag.get("name", ""))) == wanted:
                 try:
                     return int(tag["id"])
                 except (KeyError, TypeError, ValueError):
                     return None
-        if not create:
-            return None
-        created = request_json(
-            "POST",
-            self.base + "/api/tags/",
-            body={"name": name[:128], "match": "", "matching": 0},
-            headers=self.headers,
-            timeout=self.cfg.api_timeout,
-        )
-        if isinstance(created, dict) and "id" in created:
-            with self._lock:
-                self._tax_cache.pop("tag", None)
-            LOG.info("created tag %r (id %s)", name, created["id"])
-            try:
-                return int(created["id"])
-            except (TypeError, ValueError):
-                return None
         return None
+
+    def tag_id(self, name, create=True):
+        """Find a tag by exact (accent/case-insensitive) name, optionally create it."""
+        wanted = normalize(name)
+        found = self._find_tag_id(wanted)
+        if found is not None or not create:
+            return found
+        with self._tag_create_lock:
+            found = self._find_tag_id(wanted)
+            if found is not None:
+                return found
+            try:
+                created = request_json(
+                    "POST",
+                    self.base + "/api/tags/",
+                    body={"name": name[:128], "match": "", "matching": 0},
+                    headers=self.headers,
+                    timeout=self.cfg.api_timeout,
+                )
+            except HTTPProblem as exc:
+                if exc.status == 400:
+                    with self._lock:
+                        self._tax_cache.pop("tag", None)
+                    return self._find_tag_id(wanted)
+                raise
+            if isinstance(created, dict) and "id" in created:
+                with self._lock:
+                    self._tax_cache.pop("tag", None)
+                LOG.info("created tag %r (id %s)", name, created["id"])
+                try:
+                    return int(created["id"])
+                except (TypeError, ValueError):
+                    return None
+            return None
 
 
 # --------------------------------------------------------------------------
@@ -616,7 +694,7 @@ def shortlist(candidates, text, limit, exclude=frozenset()):
             continue
         score = 0.0
         norm_name = normalize(name)
-        if len(norm_name) > 2 and norm_name in norm_text:
+        if len(norm_name) > 2 and re.search(r"(?<!\w)" + re.escape(norm_name) + r"(?!\w)", norm_text):
             score += 4.0
         name_tokens = {stem(word) for word in tokenize(name)}
         if name_tokens and doc_tokens:
@@ -724,7 +802,7 @@ def decide_single_field(cfg, pl, ollama, field, state, question, existing_id):
     return decision
 
 
-def marker_tag_ids(cfg, pl):
+def marker_tag_ids(cfg, pl, tags=None):
     """Ids of the bookkeeping tags this service writes for its own state machine.
 
     `auto-tagged` / `needs-review` are metadata, not subjects a document can be
@@ -737,7 +815,7 @@ def marker_tag_ids(cfg, pl):
     if not wanted:
         return set()
     ids = set()
-    for tag in pl.taxonomy("tag"):
+    for tag in (tags if tags is not None else pl.taxonomy("tag")):
         if normalize(str(tag.get("name", ""))) in wanted:
             try:
                 ids.add(int(tag["id"]))
@@ -746,7 +824,7 @@ def marker_tag_ids(cfg, pl):
     return ids
 
 
-def skip_tag_ids(cfg, pl):
+def skip_tag_ids(cfg, pl, tags=None):
     """Ids for DECIDER_SKIP_TAGS: taxonomy entries that must never be subjects.
 
     The bookkeeping tags are handled by marker_tag_ids; this covers the rest -
@@ -761,7 +839,7 @@ def skip_tag_ids(cfg, pl):
         return set()
     ids = set()
     seen = set()
-    for tag in pl.taxonomy("tag"):
+    for tag in (tags if tags is not None else pl.taxonomy("tag")):
         name = normalize(str(tag.get("name", "")))
         if name in wanted:
             seen.add(name)
@@ -769,10 +847,11 @@ def skip_tag_ids(cfg, pl):
                 ids.add(int(tag["id"]))
             except (TypeError, ValueError, KeyError):
                 continue
-    for missing in sorted(wanted - seen):
-        if missing not in WARNED_MISSING_SKIP:
-            WARNED_MISSING_SKIP.add(missing)
-            LOG.warning("DECIDER_SKIP_TAGS entry %r matches no visible tag name", missing)
+    with WARNED_LOCK:
+        for missing in sorted(wanted - seen):
+            if missing not in WARNED_MISSING_SKIP:
+                WARNED_MISSING_SKIP.add(missing)
+                LOG.warning("DECIDER_SKIP_TAGS entry %r matches no visible tag name", missing)
     return ids
 
 
@@ -816,16 +895,23 @@ def ask_tag_probabilities(cfg, ollama, state, labels):
     reasked = set()
     for label in labels:
         if label not in probs:
-            probs[label] = ask_alone(label)
+            try:
+                probs[label] = ask_alone(label)
+            except DecisionError as exc:
+                LOG.warning("solo ask failed for tag %r: %s", label, exc)
         elif cfg.grey_zone and abs(probs[label] - cfg.thresh_tag) <= cfg.grey_zone:
-            probs[label] = ask_alone(label)
-            reasked.add(label)
+            try:
+                probs[label] = ask_alone(label)
+                reasked.add(label)
+            except DecisionError as exc:
+                LOG.warning("solo re-ask failed for tag %r, keeping batched score: %s", label, exc)
     return {label: (probs.get(label, 0.0), label in reasked) for label in labels}
 
 
 def decide_tags(cfg, pl, ollama, state, current_tag_ids):
-    blocked = set(current_tag_ids) | marker_tag_ids(cfg, pl) | skip_tag_ids(cfg, pl)
-    candidates = shortlist(pl.taxonomy("tag"), state, cfg.max_tag_options or None,
+    tags = pl.taxonomy("tag")
+    blocked = set(current_tag_ids) | marker_tag_ids(cfg, pl, tags=tags) | skip_tag_ids(cfg, pl, tags=tags)
+    candidates = shortlist(tags, state, cfg.max_tag_options or None,
                            exclude=blocked)
     labels = [cand['name'] for cand in candidates]
     scored = ask_tag_probabilities(cfg, ollama, state, labels)
@@ -972,11 +1058,13 @@ def process_document(doc_id, cfg, pl, ollama):
         "document_type": cfg.q_document_type,
         "storage_path": cfg.q_storage_path,
     }
+    initial_single_ids = {}
     for field in SINGLE_FIELDS:
         if field not in cfg.fields:
             continue
         existing = doc.get(field)
-        existing_id = int(existing) if isinstance(existing, int) else None
+        existing_id = int(existing) if isinstance(existing, int) and not isinstance(existing, bool) else None
+        initial_single_ids[field] = existing_id
         decision = decide_single_field(cfg, pl, ollama, field, state, questions[field], existing_id)
         decisions[field] = decision.as_dict()
         if decision.kind == "skip":
@@ -1006,7 +1094,7 @@ def process_document(doc_id, cfg, pl, ollama):
     marker_ids = set(payload.get("tags") or existing_tags)
     wanted_marker = (cfg.review_tag if needs_review else cfg.done_tag) or None
     if wanted_marker:
-        marker_id = pl.tag_id(wanted_marker)
+        marker_id = pl.tag_id(wanted_marker, create=not cfg.dry_run)
         if marker_id is not None and marker_id not in marker_ids:
             marker_ids.add(marker_id)
             payload["tags"] = sorted(marker_ids)
@@ -1048,7 +1136,11 @@ def process_document(doc_id, cfg, pl, ollama):
         else:
             payload["tags"] = merged
     for field in SINGLE_FIELDS:
-        if field in payload and fresh.get(field) not in (None, ""):
+        if field not in payload:
+            continue
+        fresh_val = fresh.get(field)
+        changed_by_other = fresh_val not in (None, "") and fresh_val != initial_single_ids.get(field)
+        if changed_by_other or (not cfg.overwrite and fresh_val not in (None, "")):
             payload.pop(field)
             report.setdefault("skipped_stale_fields", []).append(field)
     if report.get("skipped_stale_fields"):
@@ -1096,8 +1188,8 @@ class Worker:
         try:
             self.queue.put_nowait(doc_id)
         except queue.Full:
-            self.dropped += 1
             with self.lock:
+                self.dropped += 1
                 self.inflight.pop(doc_id, None)
             LOG.error("queue full, dropped document %s", doc_id)
             return "full"
@@ -1110,28 +1202,39 @@ class Worker:
     def run(self):
         while True:
             doc_id = self.queue.get()
+            if doc_id is None:
+                self.queue.task_done()
+                break
             try:
-                RESULTS.appendleft(process_document(doc_id, self.cfg, self.pl, self.ollama))
+                report = process_document(doc_id, self.cfg, self.pl, self.ollama)
+                with RESULTS_LOCK:
+                    RESULTS.appendleft(report)
             except Exception as exc:
-                self.failed += 1
+                with self.lock:
+                    self.failed += 1
                 LOG.exception("decision failed for document %s", doc_id)
                 # /status is the only place an operator can see WHY a document was
                 # never tagged, so keep one readable line. These messages carry URLs
                 # and response bodies, never the request headers, so no token leaks.
-                RESULTS.appendleft(
-                    {
-                        "document_id": doc_id,
-                        "error": type(exc).__name__ + ": " + " ".join(str(exc).split())[:300],
-                    },
-                )
-                # Let a later webhook delivery (or a manual retry) try again.
-                self.forget(doc_id)
+                with RESULTS_LOCK:
+                    RESULTS.appendleft(
+                        {
+                            "document_id": doc_id,
+                            "error": type(exc).__name__ + ": " + " ".join(str(exc).split())[:300],
+                        },
+                    )
             finally:
+                self.forget(doc_id)
                 self.queue.task_done()
 
 
+def _recent_results(limit=15):
+    with RESULTS_LOCK:
+        return list(RESULTS)[:limit]
+
+
 class Handler(BaseHTTPRequestHandler):
-    server_version = "paperless-decider/1.0"
+    server_version = "paperless-decider/" + VERSION
     protocol_version = "HTTP/1.1"
 
     cfg = None
@@ -1139,11 +1242,20 @@ class Handler(BaseHTTPRequestHandler):
     pl = None
     ollama = None
 
+    def setup(self):
+        super().setup()
+        timeout = getattr(self.cfg, "api_timeout", 30.0) if self.cfg else 30.0
+        self.request.settimeout(timeout)
+
     def _send(self, status, payload):
         body = json.dumps(payload, default=str).encode()
+        if status >= 400:
+            self.close_connection = True
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
+        if self.close_connection:
+            self.send_header("Connection", "close")
         self.end_headers()
         self.wfile.write(body)
 
@@ -1154,7 +1266,7 @@ class Handler(BaseHTTPRequestHandler):
         if not supplied:
             auth = self.headers.get("Authorization") or ""
             supplied = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
-        return supplied == self.cfg.secret
+        return hmac.compare_digest(supplied, self.cfg.secret)
 
     def _reject_unless_authorized(self, path):
         """Every endpoint but /healthz leaks document titles, so it is guarded.
@@ -1181,10 +1293,21 @@ class Handler(BaseHTTPRequestHandler):
         return None
 
     def _read_payload(self):
-        length = int(self.headers.get("Content-Length") or 0)
-        raw = self.rfile.read(min(length, MAX_BODY_BYTES)) if length else b""
+        raw_len = self.headers.get("Content-Length")
+        if raw_len is None or raw_len.strip() == "":
+            length = 0
+        else:
+            try:
+                length = int(raw_len.strip())
+            except ValueError:
+                return None, 400
+            if length < 0:
+                return None, 400
+            if length > MAX_BODY_BYTES:
+                return None, 413
+        raw = self.rfile.read(length) if length else b""
         if not raw:
-            return {}, True
+            return {}, 200
         text = raw.decode("utf-8", "replace")
         try:
             decoded = json.loads(text)
@@ -1192,11 +1315,11 @@ class Handler(BaseHTTPRequestHandler):
             # paperless can send a templated string body instead of JSON params
             match = re.search("(?:id|document_id)[^0-9]{0,4}([0-9]{1,9})", text)
             if match:
-                return {"id": int(match.group(1))}, True
-            return None, False
+                return {"id": int(match.group(1))}, 200
+            return None, 400
         if isinstance(decoded, dict):
-            return decoded, True
-        return {"id": decoded}, True
+            return decoded, 200
+        return {"id": decoded}, 200
 
     def do_POST(self):
         parsed = urllib.parse.urlparse(self.path)
@@ -1213,9 +1336,12 @@ class Handler(BaseHTTPRequestHandler):
             return
         if not self._reject_unless_authorized(path):
             return
-        payload, ok = self._read_payload()
-        if not ok:
-            self._send(400, {"error": "body was neither JSON nor contained an id"})
+        payload, body_status = self._read_payload()
+        if body_status == 413:
+            self._send(413, {"error": "payload too large"})
+            return
+        if body_status != 200:
+            self._send(400, {"error": "invalid Content-Length or body was neither JSON nor contained an id"})
             return
         doc_id = self._extract_doc_id(payload or {})
         if doc_id is None:
@@ -1259,6 +1385,7 @@ class Handler(BaseHTTPRequestHandler):
                 200,
                 {
                     "ok": True,
+                    "version": VERSION,
                     "model": self.cfg.model,
                     "queue": self.worker.queue.qsize(),
                     "wait_for_title": self.cfg.wait_for_title,
@@ -1269,6 +1396,7 @@ class Handler(BaseHTTPRequestHandler):
             self._send(
                 200,
                 {
+                    "version": VERSION,
                     "queue": self.worker.queue.qsize(),
                     "dropped": self.worker.dropped,
                     "failed": self.worker.failed,
@@ -1283,7 +1411,7 @@ class Handler(BaseHTTPRequestHandler):
                                               or "all in one request"),
                     "grey_zone": self.cfg.grey_zone,
                     "skip_tags": list(self.cfg.skip_tags),
-                    "last_results": list(RESULTS)[:15],
+                    "last_results": _recent_results(15),
                 },
             )
             return
@@ -1334,8 +1462,11 @@ def main():
         LOG.info("never offered as tag candidates: %s", ",".join(cfg.skip_tags))
 
     worker = Worker(cfg, pl, ollama)
+    worker_threads = []
     for index in range(cfg.workers):
-        threading.Thread(target=worker.run, name="decider-" + str(index), daemon=True).start()
+        t = threading.Thread(target=worker.run, name="decider-" + str(index), daemon=True)
+        t.start()
+        worker_threads.append(t)
 
     Handler.cfg = cfg
     Handler.worker = worker
@@ -1356,10 +1487,11 @@ def main():
     signal.signal(signal.SIGTERM, shutdown)
     signal.signal(signal.SIGINT, shutdown)
     LOG.info(
-        "listening on %s:%s | fields=%s thresh(single=%.2f tag=%.2f) overwrite=%s "
+        "listening on %s:%s | version=%s fields=%s thresh(single=%.2f tag=%.2f) overwrite=%s "
         "dry_run=%s wait_for_title=%s model=%s auth=%s tags_asked=%s questions_per_request=%s grey_zone=%.3f",
         cfg.host,
         cfg.port,
+        VERSION,
         ",".join(cfg.fields),
         cfg.thresh_single,
         cfg.thresh_tag,
@@ -1376,6 +1508,13 @@ def main():
         httpd.serve_forever()
     finally:
         httpd.server_close()
+        for _ in worker_threads:
+            try:
+                worker.queue.put_nowait(None)
+            except queue.Full:
+                pass
+        for t in worker_threads:
+            t.join(timeout=10.0)
     return 0
 
 

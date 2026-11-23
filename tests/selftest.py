@@ -747,6 +747,71 @@ def main():
         str(refused)[:220],
     )
 
+    # ---- 2026-11-22 review fixes ----
+    # 1. dry_run / preview must NOT create missing marker tags
+    tags_before_dry = len(TAGS)
+    dry_marker_cfg = dataclasses.replace(cfg, dry_run=True, done_tag="brand-new-done-tag")
+    decider.process_document(77, dry_marker_cfg, pl, ollama)
+    check(
+        "dry_run does not create missing marker tags in paperless",
+        len(TAGS) == tags_before_dry,
+        "tags count=" + str(len(TAGS)),
+    )
+
+    # 2. DECIDER_OVERWRITE=true overwrites pre-existing single fields
+    overwrite_cfg = dataclasses.replace(cfg, fields=("correspondent", "storage_path"), overwrite=True)
+    patch_before = len(PATCHES)
+    ow = decider.process_document(77, overwrite_cfg, pl, ollama)
+    ow_patch = PATCHES[-1]["body"] if len(PATCHES) > patch_before else {}
+    check(
+        "overwrite=true actually patches pre-existing single fields when unchanged during wait",
+        ow_patch.get("correspondent") == 10 and "correspondent" in ow.get("would_patch", {}),
+        str(ow_patch),
+    )
+
+    # 3. Worker allows re-submitting a doc_id after it finishes (Workflow 2)
+    re_worker = decider.Worker(cfg, pl, ollama)
+    check("worker accepts first submit", re_worker.submit(77) == "queued")
+    check("worker deduplicates while in-flight", re_worker.submit(77) == "duplicate")
+    threading.Thread(target=re_worker.run, daemon=True).start()
+    re_worker.queue.join()
+    check("worker accepts re-submit after completion", re_worker.submit(77) == "queued")
+    re_worker.queue.put(None)
+
+    # 4. Content-Length validation (400 on negative/invalid, 413 on oversized)
+    import http.client
+    conn = http.client.HTTPConnection("127.0.0.1", SIDECAR_PORT, timeout=5)
+    conn.request("POST", "/decide", body=b"", headers={"X-Decider-Token": SECRET, "Content-Length": "-5"})
+    neg_resp = conn.getresponse()
+    neg_resp.read()
+    conn.close()
+    check("negative Content-Length rejected with 400", neg_resp.status == 400, str(neg_resp.status))
+
+    conn = http.client.HTTPConnection("127.0.0.1", SIDECAR_PORT, timeout=5)
+    conn.request("POST", "/decide", body=b"", headers={"X-Decider-Token": SECRET, "Content-Length": "99999999"})
+    big_resp = conn.getresponse()
+    big_resp.read()
+    conn.close()
+    check("oversized Content-Length rejected with 413", big_resp.status == 413, str(big_resp.status))
+
+    # 5. Config.validate rejects non-http OLLAMA_URL
+    bad_ollama_cfg = dataclasses.replace(cfg, ollama_url="file:///etc/passwd")
+    bad_url_ok = False
+    try:
+        bad_ollama_cfg.validate()
+    except decider.ConfigError:
+        bad_url_ok = True
+    check("Config.validate rejects non-http OLLAMA_URL", bad_url_ok)
+
+    # 6. shortlist word-boundary matching does not boost 'car' on 'care'/'card'
+    car_tags = [{"id": 1, "name": "car", "document_count": 1}, {"id": 2, "name": "card", "document_count": 1}]
+    ranked_car = decider.shortlist(car_tags, "Thank you for your care and your card.", 2)
+    check(
+        "shortlist uses word boundaries instead of raw substring match",
+        ranked_car[0]["name"] == "card" and ranked_car[1]["score"] < ranked_car[0]["score"],
+        str(ranked_car),
+    )
+
     for httpd in fakes + [sidecar]:
         httpd.shutdown()
 
